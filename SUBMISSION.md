@@ -2,9 +2,18 @@
 
 Notes for OpenWrt maintainers reviewing this contribution.
 
-## Title
+## The series
 
-`realtek: add support for Open Mesh S24v3 / Datto E24v3`
+Two patches, **independently applicable**:
+
+1. `realtek: add support for Open Mesh S24v3 / Datto E24v3` — the device
+   support. Stands alone.
+2. `realtek: openmesh_e24: program the LM63 fan controller` — the fan
+   bring-up. Can be taken, deferred, or rewritten without affecting patch 1.
+
+Patch 2 is separate so the two can be judged on their own merits, **not**
+because it is optional in practice: without it the board boots with stopped
+fans on a 410 W PoE chassis. See "The fan patch" below.
 
 ## Base
 
@@ -15,18 +24,21 @@ Happy to rebase onto current master at any point.
 
 `Signed-off-by: James Perez-Clifton <jamesperezclifton2016@gmail.com>`
 
-The commit author and the sign-off match.
+On both commits the author, the committer and the sign-off all match.
 
 ---
 
 ## What is included
 
-One commit, two files, no new driver and no new package:
+Two commits, three files, **no new driver, no new package and no new file
+outside the DTS**:
 
-| File | Change |
-|---|---|
-| `target/linux/realtek/dts/rtl8391_openmesh_e24.dts` | new, 508 lines |
-| `target/linux/realtek/image/rtl839x.mk` | `Device/openmesh_e24`, 13 lines |
+| Patch | File | Change |
+|---|---|---|
+| 1 | `target/linux/realtek/dts/rtl8391_openmesh_e24.dts` | new, 508 lines |
+| 1 | `target/linux/realtek/image/rtl839x.mk` | `Device/openmesh_e24`, 13 lines |
+| 2 | `target/linux/realtek/base-files/etc/init.d/hwmon_fancontrol` | per-board branch, +165 lines |
+| 2 | `target/linux/realtek/image/rtl839x.mk` | adds the `i2c-tools` runtime dependency, 1 line |
 
 Everything the device needs at runtime is already in the tree:
 
@@ -34,7 +46,8 @@ Everything the device needs at runtime is already in the tree:
   (`kmod-pse-realtek-mcu-i2c`). The MCU's 12-byte frame is byte-for-byte the
   dialect that driver already speaks; no new backend, no firmware blob.
 - **Thermal** binds the existing `national,lm63` hwmon driver
-  (`kmod-hwmon-lm63`).
+  (`kmod-hwmon-lm63`), and patch 2 programs it from the existing
+  `hwmon_fancontrol` init script — no new file.
 - **Transport** to both of the above is `i2c-gpio` over two SoC GPIO lines.
 - **Boot** is the stock loader, stamped-uImage mechanism already used by
   `datto_l8`; no U-Boot replacement, no new image recipe machinery.
@@ -42,61 +55,99 @@ Everything the device needs at runtime is already in the tree:
 The package list is deliberately the same shape as the in-tree
 `linksys_lgs328mpc-v2`, which is the closest existing board (same LM63 + PSE
 MCU pairing): `kmod-hwmon-lm63 kmod-pse-realtek-mcu-i2c`, plus `ethtool-full`
-because the PSE API is the only way to drive PoE from userspace.
+because the PSE API is the only way to drive PoE from userspace. Patch 2 adds
+`i2c-tools`, which it needs at runtime.
+
+---
+
+## The fan patch (2/2)
+
+**Why it exists.** The stock bootloader hands the LM63 over in manual mode
+(register `0x4a` = `0x20`) with PWM value `0x00` — the fans are not driven at
+all — and binding `national,lm63` only exposes the chip, it does not program
+it. So patch 1 on its own produces a booting board with stopped fans, on a
+chassis with a 410 W PoE budget. Patch 2 programs the vendor's lookup table at
+boot so the chip runs the fans from its own temperature control.
+
+**Why it is device support and not scope creep.**
+`target/linux/realtek/base-files/etc/init.d/hwmon_fancontrol` already carries
+per-board branches for four boards, including `linksys,lgs328mpc-v2` — the same
+LM63-plus-PSE-MCU pairing, with a bootloader that leaves the chip unconfigured
+in the same way. Adding a branch to that existing file is exactly how this tree
+does per-board fan setup.
+
+**Honest caveats, stated in the commit message too:**
+
+- The register values are **replicated verbatim** from the vendor firmware's
+  init, in the vendor's order. The precise temperature and duty-cycle semantics
+  of the resulting curve are **not confirmed** — the bytes are reproduced, not
+  interpreted, and the code asserts no interpretation of them.
+- **Raw `i2cset -f`, not hwmon sysfs.** The sibling `linksys_lgs328mpc_v2()`
+  uses the hwmon attributes, which is the nicer interface, but the vendor's
+  register image is not reachable through it on current kernels: `0x4d`
+  (`PWM_FREQ`) must hold PFR 31 while `0x4a` keeps its SCS bit set, and
+  `pwm1_freq_store()` derives PFR from a frequency in Hz and picks SCS itself
+  (PFR 31 is only reachable from the 180 kHz base, which clears SCS; 700/22
+  rounds to 32 and 700/23 to 30); bit `0x02` of `0x4a` is not writable through
+  any attribute; and `pwm1_enable=2` is refused with `-EPERM` by
+  `lm63_lut_looks_bad()` unless all eight LUT points are monotonic, while the
+  vendor programs two. The `lm63` driver claims `0x4c`, so the `-f` is a
+  requirement, not a shortcut.
+  **If you would rather have a sysfs-driven curve of our own choosing** —
+  padding the LUT to eight monotonic points the way `linksys_lgs328mpc_v2()`
+  does, and accepting a curve that is not byte-identical to the vendor's — that
+  is a reasonable alternative and the change is small. It is written this way
+  because reproducing the shipped image is the conservative choice on hardware
+  whose thermal design is not documented.
+
+**Safety properties, because it writes raw registers on a shared bus:**
+
+- The **PoE MCU shares this bus**, so nothing is written until the address has
+  identified itself as an LM63: manufacturer (`0xfe`) = `0x01`, chip (`0xff`) =
+  `0x41`. Otherwise it logs and writes nothing.
+- The bus number is resolved from the `lm63` driver's own binding, falling back
+  to probing the adapters — adapter numbering depends on probe order.
+- Every write is **read back**, up to three attempts.
+- **Verified fallback**: if any write does not read back, the chip is forced
+  into manual mode at full PWM. A noisy switch is an acceptable failure mode;
+  an unventilated one is not.
+- Every path is logged and the function always returns success, so a
+  fan-control problem can never fail the boot sequence.
+- Re-running rewrites the same bytes — idempotent.
 
 ---
 
 ## What is deliberately excluded, and why
 
-### 1. The fan-curve init entry — the one real gap
-
-The DTS binds the LM63 but does not program it, and **the stock bootloader hands
-the chip over in manual mode with PWM 0 — the fans are not driven at all.** On a
-410 W PoE chassis that matters. The fix is a per-board function in the existing
-`target/linux/realtek/base-files/etc/init.d/hwmon_fancontrol`, exactly where
-`linksys_lgs328mpc_v2()` already lives in that file.
-
-It is held out of this commit to keep the device commit to DTS + recipe, and is
-offered as a second patch in the same series the moment a maintainer wants it.
-If the preference is one series, say so and it will be folded in. It is flagged
-here rather than left quiet because a merged board with stopped fans is a worse
-outcome than a noisy review.
-
-Two things about that entry a reviewer should know in advance: it writes the
-LM63 with `i2cset -f` rather than through hwmon sysfs (the vendor's register
-image is not reachable through the sysfs attributes on 6.x — PWM_FREQ PFR 31
-with the SCS bit set is unreachable from `pwm1_freq_store()`, and `pwm1_enable=2`
-is refused by `lm63_lut_looks_bad()` for a two-point LUT), and on any write that
-does not read back it falls back to manual mode at full PWM.
-
-### 2. The 10G SFP+ ports
+### 1. The 10G SFP+ ports
 
 Both cages are `status = "disabled"`. See "Known limitations" below. This is the
 main functional gap and the obvious follow-up contribution.
 
-### 3. PoE userspace
+### 2. PoE userspace
 
-No CLI, no LuCI page, no UCI config in this commit. Per-port control and
+No CLI, no LuCI page, no UCI config in this series. Per-port control and
 class/power telemetry are reachable through the kernel PSE API via `ethtool`,
 which is what upstream expects; anything friendlier is a downstream image
 concern.
 
-### 4. Debug tooling in `DEVICE_PACKAGES`
+### 3. Debug tooling in `DEVICE_PACKAGES`
 
-The locally validated build also shipped `i2c-tools`, `gpiod-tools` and
-`tcpdump` for bring-up. They are not in the submitted recipe — none of them is
-needed by anything in this commit. (`i2c-tools` becomes a real dependency if and
-when the fan-curve patch above lands, and will be added with it.)
+The locally validated build also shipped `gpiod-tools` and `tcpdump` for
+bring-up. Neither is in the submitted recipe — nothing in this series needs
+them. (`i2c-tools` was in that same bring-up set, but it *is* a genuine runtime
+dependency of the fan patch, so patch 2 adds it. There is precedent on this
+target: `tplink_sg2008p-v3` already ships `i2c-tools`.)
 
-### 5. Anything derived from the vendor firmware image
+### 4. Anything derived from the vendor firmware image
 
 No vendor binary, no vendor configuration, no extracted blob and no
-unit-specific data is present in this repository or in the patch. The vendor
+unit-specific data is present in this repository or in either patch. The vendor
 firmware was read only to recover facts — GPIO line numbers, the PSE port-map
 table, the uImage board-ID word — and only those facts are reproduced, in
 comments.
 
-### 6. `board.d`
+### 5. `board.d`
 
 None required.
 
@@ -124,7 +175,7 @@ Validated on a real unit running an OpenWrt build of this patch from flash.
 | PoE — transport | `i2c-gpio` bus comes up; MCU ACKs at 0x20 and answers the identify command. |
 | PoE — delivery | A real PD is detected, classified and powered; per-port enable/disable works; delivered power and class read back via `ethtool`. |
 | PoE — port mapping | Confirmed by moving a PD between ports: the raw channel order is port ^ 3, and the DTS mapping corrects it (see below). |
-| Thermal | LM63 at 0x4c ACKs; manufacturer (0xFE) = 0x01, chip (0xFF) = 0x41. Fan control active once the init entry programs the curve. |
+| Thermal | LM63 at 0x4c ACKs; manufacturer (0xFE) = 0x01, chip (0xFF) = 0x41. With patch 2 the vendor table is programmed and automatic fan control is active. |
 | LEDs | Power, fault, LAN/PoE-mode and PoE-budget behave per the board map. |
 | Buttons | Reset works. LED-mode button works; its `GPIO_ACTIVE_LOW` polarity is inferred from the vendor handler, not bench-measured. |
 | MAC address | Correct factory MAC from `u-boot-env` `ethaddr` via nvmem. |
@@ -153,7 +204,11 @@ produces the identical set. Nothing is introduced by this board.
    (SerDes 12), MIIM port indices 25/26, module EEPROMs at I2C 0x50 on the
    shared bit-banged bus, and the presence/LOS sidebands on the RTL8231
    expander.
-2. **Fan curve not programmed by this commit** — see exclusion 1.
+2. **The fan curve values are replicated, not understood.** Patch 2 programs
+   them and automatic fan control works, but the exact temperature and
+   duty-cycle semantics of the vendor LUT are unconfirmed — see "The fan
+   patch". And if patch 1 is taken without patch 2, the board boots with
+   stopped fans.
 3. **A/B failover is given up.** The two stock `RUNTIME` slots are
    `mtd-concat`'d into one firmware region so kernel + rootfs + overlay fit,
    as the upstream `datto_l8` sibling also does.
@@ -211,7 +266,15 @@ The PSE node is `compatible = "openmesh,e24-pse", "realtek,pse-mcu-gen1-smbus"`.
 The first string is not in any binding; it binds via the fallback. Trivially
 dropped if preferred.
 
-### 5. SFP+ `disabled` vs `fixed-link`
+### 5. Patch 2 writes the LM63 with raw I2C, not hwmon sysfs
+
+The sibling `linksys_lgs328mpc_v2()` in the same file uses the hwmon
+attributes. Patch 2 does not, and the reasons — plus the offer to rewrite it as
+a padded eight-point sysfs LUT if that is preferred — are set out in full under
+"The fan patch (2/2)" above. This is the most likely thing to be argued about
+in that patch, so it is called out here as well.
+
+### 6. SFP+ `disabled` vs `fixed-link`
 
 Reviewers of the sibling S24 asked about the `fixed-link` idiom. The reasoning
 here is the opposite and is set out under "Known limitations" — on this board a
@@ -243,7 +306,7 @@ it in a minute and it would be wasteful not to mention it.
 
 ## Supporting documentation
 
-Not part of the patch, but written up for whoever reviews or ports next:
+Not part of the series, but written up for whoever reviews or ports next:
 
 - `docs/HARDWARE.md` — full board map.
 - `docs/POE.md` — the PoE subsystem, the wire protocol and the port-map trap.

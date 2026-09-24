@@ -2,9 +2,11 @@ This repository carries OpenWrt device-support material for the
 Open Mesh S24v3 / Datto E24v3, offered for upstream review.
 
 The device-support material -- the device tree source
-(target/linux/realtek/dts/rtl8391_openmesh_e24.dts) and the image recipe
-block for target/linux/realtek/image/rtl839x.mk, as contained in
-patches/ and mirrored in dts/ and image/ -- is licensed under:
+(target/linux/realtek/dts/rtl8391_openmesh_e24.dts), the image recipe
+block for target/linux/realtek/image/rtl839x.mk, and the per-board
+branch for target/linux/realtek/base-files/etc/init.d/hwmon_fancontrol,
+as contained in patches/ and mirrored in dts/, image/ and base-files/ --
+is licensed under:
 
     SPDX-License-Identifier: GPL-2.0-or-later
 

@@ -201,7 +201,13 @@ over-budget indicator.
 The **LM63 at 0x4C shares this bus**, and the stock bootloader leaves it in
 manual mode at PWM 0 — **fans stopped**. Binding the hwmon driver exposes the
 chip; it does not program it. Under real PoE load an unventilated 410 W chassis
-is a hazard, so a port must program the fan curve at boot.
+is a hazard, so a port must program the fan curve at boot. Patch `0002` in this
+repo does that.
+
+Because the PoE MCU and the LM63 are on the *same* bus, anything that writes the
+fan controller must gate on identity first — manufacturer (`0xFE`) = `0x01`,
+chip (`0xFF`) = `0x41` — or a stray write lands on the PoE MCU. Patch `0002`
+does, and it verifies every register by read-back before trusting it.
 
 Details, including why the vendor's register image cannot be reproduced through
 hwmon sysfs on current kernels, are in `docs/HARDWARE.md`.

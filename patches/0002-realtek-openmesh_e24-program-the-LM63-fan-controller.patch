@@ -1,0 +1,290 @@
+From e9f7df97a08667e870a41c8d0a0b55619ce48489 Mon Sep 17 00:00:00 2001
+From: James Perez-Clifton <jamesperezclifton2016@gmail.com>
+Date: Thu, 24 Sep 2026 06:15:14 +0000
+Subject: [PATCH 2/2] realtek: openmesh_e24: program the LM63 fan controller
+
+The Open Mesh S24v3 / Datto E24v3 has an LM63 fan controller and
+temperature sensor at 0x4c, on the software bit-banged i2c-gpio bus it
+shares with the PoE MCU. The device tree binds national,lm63 to it, but
+binding the hwmon driver only exposes the chip - it does not program it.
+
+The stock bootloader hands the chip over in manual mode (register 0x4a =
+0x20) with PWM value 0x00, which means the fans are not driven at all.
+Without this patch the board therefore boots with stopped fans, and it
+is a 24-port chassis with a 410 W PoE budget. Program the vendor's
+lookup table at boot so the chip runs the fans from its own temperature
+control.
+
+This follows the existing per-board pattern in this file; the closest
+sibling is linksys,lgs328mpc-v2, which has the same LM63 plus PSE-MCU
+pairing and whose bootloader leaves the chip unconfigured in the same
+way.
+
+Register values
+---------------
+
+The register image is replicated verbatim from the vendor firmware's
+init, in the vendor's order. 0x4a = 0x2a first sets the LUT-disable bit
+so the table is writable, and 0x4a = 0x0a last clears it and hands the
+fan back to the chip's own temperature control; LUT writes are ignored
+while the table is locked. Re-running rewrites the same bytes, so this
+is idempotent.
+
+The precise temperature and duty-cycle semantics of the resulting curve
+are not confirmed. The bytes are reproduced rather than interpreted, and
+no interpretation is asserted in the code.
+
+Why raw i2c writes and not the hwmon sysfs LUT
+----------------------------------------------
+
+linksys_lgs328mpc_v2() drives its LM63 through the hwmon attributes.
+That is the nicer interface, but the vendor's register image cannot be
+reproduced through it on current kernels:
+
+- 0x4d (PWM_FREQ) must hold 0x1f (PFR 31) while 0x4a keeps its SCS bit
+  (0x08) set. pwm1_freq_store() takes a frequency in Hz, derives PFR
+  with DIV_ROUND_CLOSEST(base, hz) and picks SCS itself. PFR 31 is only
+  reachable from the 180 kHz base, which clears SCS; 700/22 rounds to 32
+  and 700/23 to 30, so PFR 31 with SCS set cannot be requested.
+- Bit 0x02 of 0x4a is not writable through any hwmon attribute.
+- pwm1_enable=2 is refused with -EPERM by lm63_lut_looks_bad() unless
+  all eight LUT points are monotonic, and the vendor programs only two.
+
+The lm63 driver claims 0x4c, so i2c-dev refuses the address unless it is
+forced; the -f is a requirement here, not a shortcut. Writing behind the
+driver leaves its cached copy stale until its next update_interval
+refresh, which changes what sysfs reports, not what the chip does.
+
+If a maintainer would rather have a sysfs-driven curve of our own
+choosing - padding the LUT to eight monotonic points the way
+linksys_lgs328mpc_v2() does, and accepting a curve that is not
+byte-identical to the vendor's - that is a reasonable alternative and
+the change is straightforward. It is written this way because
+reproducing the shipped image is the conservative option on hardware
+whose thermal design is not documented.
+
+Safety properties
+-----------------
+
+- The PoE MCU shares this bus, so the code gates on identity before it
+  writes anything: manufacturer (0xfe) must read 0x01 and chip (0xff)
+  0x41. If the address does not identify as an LM63 it logs and writes
+  nothing.
+- The bus number is resolved from the lm63 driver's own binding, falling
+  back to probing the adapters, rather than being hardcoded; adapter
+  numbering depends on probe order.
+- Every register write is read back, with up to three attempts, as the
+  vendor does.
+- If any write does not read back, the chip is forced into manual mode
+  at full PWM. A noisy switch is an acceptable failure mode; an
+  unventilated one is not.
+- Every path is logged and the function always returns success, so a
+  fan-control problem can never fail the boot sequence.
+
+i2c-tools is added to DEVICE_PACKAGES because it is now a runtime
+dependency of this path. If it is missing the script logs and leaves the
+fans as the bootloader set them, rather than failing.
+
+Signed-off-by: James Perez-Clifton <jamesperezclifton2016@gmail.com>
+---
+ .../base-files/etc/init.d/hwmon_fancontrol    | 165 ++++++++++++++++++
+ target/linux/realtek/image/rtl839x.mk         |   2 +-
+ 2 files changed, 166 insertions(+), 1 deletion(-)
+
+diff --git a/target/linux/realtek/base-files/etc/init.d/hwmon_fancontrol b/target/linux/realtek/base-files/etc/init.d/hwmon_fancontrol
+index cec1e8723b..be491e3fa3 100755
+--- a/target/linux/realtek/base-files/etc/init.d/hwmon_fancontrol
++++ b/target/linux/realtek/base-files/etc/init.d/hwmon_fancontrol
+@@ -121,6 +121,168 @@ linksys_lgs328mpc_v2() {
+ 	echo 2 > "$path_to_hwmon/pwm1_enable"
+ }
+ 
++#
++# Open Mesh / Datto E24v3 (RTL8396M), LM63 at 0x4c on the bit-banged i2c-gpio
++# bus it shares with the PoE MCU.
++#
++# WHY THIS EXISTS: the stock bootloader hands the chip over in manual mode
++# (reg 0x4a = 0x20) with PWM value 0x00, i.e. the fans are not being driven at
++# all. Binding the hwmon driver exposes the chip but does not program it. On a
++# 410 W PoE switch an unventilated chassis is a thermal hazard the moment PoE
++# starts delivering power, so the lookup table has to be written here.
++#
++# WHY RAW i2cset AND NOT THE hwmon SYSFS LUT: the vendor's register image
++# cannot be reproduced through the sysfs attributes on this kernel.
++#   - reg 0x4d (PWM_FREQ) must hold 0x1f (PFR 31) while reg 0x4a keeps its SCS
++#     bit (0x08) set. pwm1_freq_store() takes a frequency in Hz, derives PFR
++#     with DIV_ROUND_CLOSEST(base, hz) and chooses SCS itself; PFR 31 is only
++#     reachable from the 180 kHz base, which clears SCS. 700/22 rounds to 32
++#     and 700/23 to 30, so PFR 31 with SCS set is unreachable.
++#   - bit 0x02 of reg 0x4a is not writable through any hwmon attribute.
++#   - pwm1_enable=2 is refused with -EPERM by lm63_lut_looks_bad() unless all
++#     eight LUT points are monotonic, and the vendor programs only two.
++# The lm63 driver claims 0x4c, so i2c-dev refuses the address unless it is
++# forced: -f here is a requirement, not a shortcut. Writing behind the driver
++# leaves its cached copy stale until its next update_interval refresh, which
++# changes what sysfs reports, not what the chip does.
++#
++# The register VALUES below are replicated verbatim from the vendor firmware's
++# initd. The precise temperature / duty-cycle semantics of the resulting curve
++# are unconfirmed, so no interpretation is asserted here.
++#
++# PARTIAL FAILURE: if any write does not read back, the chip is put into manual
++# mode at full PWM instead. A noisy switch is an acceptable failure mode; an
++# unventilated one is not. Every path is logged and the function always
++# succeeds, so a fan-control problem never fails the boot sequence.
++#
++openmesh_e24_lm63=0x4c
++
++# True only if $1 is a hex byte equal to $2, so an absent or garbled read can
++# never be mistaken for a match.
++openmesh_e24_eq() {
++	case "$1" in
++	0x[0-9a-fA-F] | 0x[0-9a-fA-F][0-9a-fA-F]) ;;
++	*) return 1 ;;
++	esac
++	[ "$(($1))" -eq "$(($2))" ]
++}
++
++openmesh_e24_rd() {
++	timeout 5 i2cget -y -f "$1" "$openmesh_e24_lm63" "$2" 2>/dev/null
++}
++
++# Resolve the bus rather than hardcoding 0: adapter numbering depends on probe
++# order. Prefer the lm63 driver's own binding; fall back to probing every
++# adapter so the bring-up still runs if the hwmon module is absent.
++openmesh_e24_bus() {
++	local d bus
++
++	for d in /sys/bus/i2c/drivers/lm63/*-004c; do
++		[ -e "$d" ] || continue
++		bus="${d##*/}"
++		printf '%s\n' "${bus%%-*}"
++		return 0
++	done
++
++	for d in /sys/class/i2c-dev/i2c-*; do
++		[ -e "$d" ] || continue
++		bus="${d##*/i2c-}"
++		if openmesh_e24_rd "$bus" 0xfe >/dev/null 2>&1; then
++			printf '%s\n' "$bus"
++			return 0
++		fi
++	done
++
++	return 1
++}
++
++# Write one register and read it back, up to 3 attempts, as the vendor does.
++openmesh_e24_wr() {
++	local bus="$1" reg="$2" val="$3"
++	local try=1 got
++
++	while [ "$try" -le 3 ]; do
++		timeout 5 i2cset -y -f "$bus" "$openmesh_e24_lm63" "$reg" "$val" 2>/dev/null
++		got="$(openmesh_e24_rd "$bus" "$reg")"
++		openmesh_e24_eq "$got" "$val" && return 0
++		# The vendor pauses ~100 us between attempts. busybox sleep only
++		# honours fractions when built with FEATURE_FLOAT_SLEEP; without
++		# it the retry still waits out a full bit-banged I2C transaction,
++		# which is already far longer than 100 us, so losing the sleep
++		# costs nothing.
++		sleep 0.001 2>/dev/null || :
++		try=$((try + 1))
++	done
++
++	logger -t hwmon_fancontrol \
++		"E24: LM63 reg $reg did not read back as $val (got ${got:-none}) after 3 attempts"
++	return 1
++}
++
++# Fail-safe: manual mode, fans flat out.
++openmesh_e24_fans_full() {
++	local bus="$1"
++
++	# 0x4a bit 0x20 disables the lookup table, which selects manual mode and
++	# makes 0x4c (PWM value) writable. 0x4d is pinned to the vendor's PFR of
++	# 31 so that 0x3e (= 2 * 31) is exactly 100% duty and in range whatever
++	# state the chip was left in.
++	timeout 5 i2cset -y -f "$bus" "$openmesh_e24_lm63" 0x4a 0x2a 2>/dev/null
++	timeout 5 i2cset -y -f "$bus" "$openmesh_e24_lm63" 0x4d 0x1f 2>/dev/null
++	timeout 5 i2cset -y -f "$bus" "$openmesh_e24_lm63" 0x4c 0x3e 2>/dev/null
++	logger -t hwmon_fancontrol \
++		"E24: LM63 bring-up FAILED - forced manual mode at full PWM"
++}
++
++openmesh_e24() {
++	local bus man chip
++
++	if ! command -v i2cset >/dev/null 2>&1 || ! command -v i2cget >/dev/null 2>&1; then
++		logger -t hwmon_fancontrol \
++			"E24: i2c-tools missing - LM63 NOT configured, fans left as the bootloader set them"
++		return 0
++	fi
++
++	bus="$(openmesh_e24_bus)" || {
++		logger -t hwmon_fancontrol \
++			"E24: no i2c bus answering at $openmesh_e24_lm63 - LM63 NOT configured"
++		return 0
++	}
++
++	# Identity gate. The PoE MCU shares this bus, so never write registers to
++	# an address that has not identified itself as an LM63: manufacturer
++	# (0xfe) = 0x01, chip (0xff) = 0x41.
++	man="$(openmesh_e24_rd "$bus" 0xfe)"
++	chip="$(openmesh_e24_rd "$bus" 0xff)"
++	if ! openmesh_e24_eq "$man" 0x01 || ! openmesh_e24_eq "$chip" 0x41; then
++		logger -t hwmon_fancontrol \
++			"E24: i2c-$bus $openmesh_e24_lm63 is not an LM63 (man=${man:-none} chip=${chip:-none}) - refusing to write, fans NOT configured"
++		return 0
++	fi
++
++	# Vendor register image, in the vendor's order. 0x4a = 0x2a first sets
++	# the LUT-disable bit so the table is writable; 0x4a = 0x0a last clears
++	# it and hands the fan back to the chip's own temperature control. The
++	# order matters: LUT writes are ignored while the table is locked.
++	# Re-running simply rewrites the same bytes, so this is idempotent.
++	if openmesh_e24_wr "$bus" 0x4a 0x2a &&
++		openmesh_e24_wr "$bus" 0x4d 0x1f &&
++		openmesh_e24_wr "$bus" 0x4f 0x0a &&
++		openmesh_e24_wr "$bus" 0x50 0x0a &&
++		openmesh_e24_wr "$bus" 0x51 0x1f &&
++		openmesh_e24_wr "$bus" 0x52 0x31 &&
++		openmesh_e24_wr "$bus" 0x53 0x3e &&
++		openmesh_e24_wr "$bus" 0x4a 0x0a
++	then
++		logger -t hwmon_fancontrol \
++			"E24: LM63 on i2c-$bus programmed with the vendor lookup table, automatic fan control active"
++	else
++		openmesh_e24_fans_full "$bus"
++	fi
++
++	return 0
++}
++
+ boot() {
+ 	case $(board_name) in
+ 	plasmacloud,esx28|\
+@@ -137,5 +299,8 @@ boot() {
+ 	linksys,lgs328mpc-v2)
+ 		linksys_lgs328mpc_v2
+ 		;;
++	openmesh,e24)
++		openmesh_e24
++		;;
+ 	esac
+ }
+diff --git a/target/linux/realtek/image/rtl839x.mk b/target/linux/realtek/image/rtl839x.mk
+index 28e064d578..fa71ab2e95 100644
+--- a/target/linux/realtek/image/rtl839x.mk
++++ b/target/linux/realtek/image/rtl839x.mk
+@@ -181,6 +181,6 @@ define Device/openmesh_e24
+   DEVICE_ALT0_MODEL := E24v3
+   UIMAGE_MAGIC := 0x00702202
+   IMAGE_SIZE := 13504k
+-  DEVICE_PACKAGES += kmod-hwmon-lm63 kmod-pse-realtek-mcu-i2c ethtool-full
++  DEVICE_PACKAGES += kmod-hwmon-lm63 kmod-pse-realtek-mcu-i2c ethtool-full i2c-tools
+ endef
+ TARGET_DEVICES += openmesh_e24
+-- 
+2.43.0
+

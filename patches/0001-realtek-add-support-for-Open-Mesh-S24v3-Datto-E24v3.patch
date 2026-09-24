@@ -1,7 +1,7 @@
 From fb52e6826ecbb688f59d68bbb7f6008a5f5e47d4 Mon Sep 17 00:00:00 2001
 From: James Perez-Clifton <jamesperezclifton2016@gmail.com>
 Date: Thu, 24 Sep 2026 06:04:25 +0000
-Subject: [PATCH] realtek: add support for Open Mesh S24v3 / Datto E24v3
+Subject: [PATCH 1/2] realtek: add support for Open Mesh S24v3 / Datto E24v3
 
 Add support for the Open Mesh S24v3, also sold as the Datto Networking
 E24v3: a 24-port Gigabit PoE+ switch with two 10G SFP+ uplinks. It is

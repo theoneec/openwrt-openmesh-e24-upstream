@@ -27,13 +27,17 @@ are built the same way.
 
 ## The change
 
-A single device commit, `realtek: add support for Open Mesh S24v3 / Datto E24v3`
-— 2 files:
+Two patches, independently applicable:
 
-- `target/linux/realtek/dts/rtl8391_openmesh_e24.dts`
-- `target/linux/realtek/image/rtl839x.mk` (adds `Device/openmesh_e24`)
+1. `realtek: add support for Open Mesh S24v3 / Datto E24v3` —
+   `target/linux/realtek/dts/rtl8391_openmesh_e24.dts` (new) and
+   `target/linux/realtek/image/rtl839x.mk` (adds `Device/openmesh_e24`).
+2. `realtek: openmesh_e24: program the LM63 fan controller` — a per-board
+   branch in the existing
+   `target/linux/realtek/base-files/etc/init.d/hwmon_fancontrol`, plus the
+   `i2c-tools` runtime dependency in the recipe.
 
-No new driver, no new package, no firmware blob.
+No new driver, no new package, no new file outside the DTS, no firmware blob.
 
 ## Notes for reviewers
 
@@ -67,14 +71,24 @@ implementation is recorded in the DTS comments (MAC IDs, SerDes, module EEPROMs
 at 0x50 on the same bit-banged bus, presence/LOS sidebands on the RTL8231). This
 is the obvious follow-up and I'm happy to work on it.
 
-**Fan control** isn't in this commit. The DTS binds the LM63 at 0x4c, but the
-stock bootloader leaves it in manual mode at PWM 0 — fans stopped — so a curve
-has to be programmed at boot. That's a per-board function in the existing
-`hwmon_fancontrol`, right next to `linksys_lgs328mpc_v2()` which is the same
-LM63 + PSE MCU combination. I've kept it as a separate follow-up patch to keep
-the device commit to DTS + recipe, but I'll fold it into one series if that's
-preferred. Flagging it loudly because a merged board with stopped fans on a
-410 W chassis is not a good outcome.
+**Fan control is patch 2.** The DTS binds the LM63 at 0x4c, but the stock
+bootloader leaves it in manual mode at PWM 0 — fans stopped — and binding the
+hwmon driver doesn't program it, so a curve has to be written at boot. That's a
+per-board function in the existing `hwmon_fancontrol`, right next to
+`linksys_lgs328mpc_v2()` which is the same LM63 + PSE MCU combination. It's a
+separate patch so you can judge the two independently, not because it's
+optional — patch 1 alone gives you a 410 W PoE chassis with stopped fans.
+One thing worth arguing about: unlike `linksys_lgs328mpc_v2()` I write the
+registers with `i2cset -f` rather than through hwmon sysfs, because the vendor's
+register image isn't reachable through the sysfs attributes (PFR 31 with the SCS
+bit set can't be requested via `pwm1_freq_store()`, bit 0x02 of 0x4a isn't
+writable at all, and `pwm1_enable=2` is refused for a two-point LUT). I
+replicate the vendor's bytes rather than interpret them — the exact
+temperature/duty semantics of that curve are unconfirmed — and there's an
+identity gate before any write (the PoE MCU is on the same bus), read-back
+verification, and a fallback to manual full PWM if anything fails to stick.
+Happy to redo it as a padded eight-point sysfs LUT instead if maintainers
+prefer that.
 
 **Boot/flash:** stock U-Boot `boota` boots a magic-stamped OpenWrt uImage
 (`UIMAGE_MAGIC=0x00702202`), same mechanism as `datto_l8`. The `.bix` container
@@ -96,8 +110,8 @@ maintainers want.
 - PoE: a real PD is detected, classified and powered, with per-port
   enable/disable and delivered-power/class readout via `ethtool`, and correct
   per-port targeting once the XOR mapping is applied.
-- LM63 present and answering (mfr 0x01, chip 0x41); fan control active with the
-  curve programmed.
+- LM63 present and answering (mfr 0x01, chip 0x41); with patch 2 applied the
+  vendor table is programmed and automatic fan control is active.
 - LEDs and buttons behave per the board map. Base MAC read from the u-boot-env.
 - Flashing and TFTP recovery exercised repeatedly.
 - **Not tested: the 10G SFP+ ports** (unsupported PHY, ports disabled).
@@ -116,8 +130,8 @@ maintainers want.
 
 ## DCO / licensing
 
-The commit is `Signed-off-by` me (DCO); the DTS is SPDX `GPL-2.0-or-later`.
-Happy to rebase onto current master, rename the compatible, split or merge the
+Both commits are `Signed-off-by` me (DCO); the DTS is SPDX `GPL-2.0-or-later`.
+Happy to rebase onto current master, rename the compatible, rework the
 fan-control patch, or address any other review feedback so it can be merged.
 
 Thanks!

@@ -137,6 +137,12 @@ does not program it, so **a port must program the curve or the chassis is
 unventilated under PoE load.** On a 410 W PoE switch that is a thermal hazard,
 not a comfort issue.
 
+**Patch `0002` in this repo does exactly that** — a per-board branch in the
+existing `target/linux/realtek/base-files/etc/init.d/hwmon_fancontrol`, gated on
+the chip identifying itself as an LM63 (the PoE MCU is on the same bus), with
+read-back verification on every write and a fallback to manual full PWM if
+anything fails to stick.
+
 Fan failure is reported on SoC `gpio0` line **22**, active low. That line is
 deliberately left **unclaimed** by every node in the DTS so it stays readable
 from userspace with the gpiod tools (`gpioget <chip> 22`). Modelling it as a
