@@ -462,6 +462,23 @@ asserting that the missing rtl839x hook causes anything. We are not asking for
 either to be actioned. They are written down only so that neither is a
 surprise to anyone who later encounters them.
 
+## Not in this series: the LED Mode button
+
+The board has a front-panel LED Mode button (our DTS binds it as
+`KEY_LIGHTS_TOGGLE` on `gpio0` line 17). On stock firmware it toggles the
+per-port LEDs between link/activity and PoE status. **Nothing in this series
+implements that behaviour** — the button is exposed as a key and that is all.
+
+We mention it because the semantics and registers have never been documented
+anywhere, and we have now recovered them from the vendor firmware: the relevant
+registers are `LED_SW_P_EN_CTRL` (`0x012C + (port/10)*4`), `LED_SW_P_CTRL`
+(`0x0144 + port*4`, with `[2:0]` = green and `[5:3]` = amber per copper port,
+values 0 = off / 1-6 = blink 32-1024 ms / 7 = steady) and the `LED_SW_CTRL`
+latch at `0x0128` bit 0. The full description, including what the PoE-mode
+LEDs signify and an honest list of what we still could not determine, is in
+`docs/UPSTREAM-STATUS.md`. If a maintainer wants that turned into a patch we
+are happy to try, but we are not claiming an untested implementation here.
+
 ## Supporting documentation
 
 Not part of the series, but written up for whoever reviews or ports next:

@@ -281,6 +281,83 @@ mac_id **24 and 26** — matching the L24/S24-L — which makes the E24v3's **24
 and 36** a real per-board difference rather than a typo on my part, as it
 probably looks.
 
+## 8. The LED Mode button — @hmartin, this is the answer you didn't get
+
+Upthread you asked @svanheule about the LED Mode button and the reply was
+essentially that `BTN_0` isn't in any standard script and has to be wired up by
+the user, and that port LEDs via the hardware peripheral aren't really
+supported on RTL838x. Nobody has written down what the button actually *does*.
+I pulled it out of the vendor firmware. **I have not implemented any of this** —
+it's a description, not a patch.
+
+**A press doesn't drive the LEDs.** It toggles a flag, and a separate 1 Hz
+thread does the work.
+
+- `board_led_mode_intr_handler` (`board.ko` 0x1918) debounces 50 ms (0xC34F µs),
+  reads gpio id `0x00020001` — bank 2 / bit 1, i.e. **SoC `gpio0` line 17** —
+  and if the data bit reads 1 it toggles `gled_mode_flag` (`board.ko`
+  `.bss+0x18`) between **0 = LAN** and **1 = PoE**. It also sets **RTL8231
+  expander dev 0 pin 4** (1 = PoE on the RTL8396M, inverted on other chips in
+  the same driver) and printks "LED MODE is chaged to POE" / "...to LAN".
+- The missing link is an unnamed **1 Hz thread at `custom.ko` `.text+0`**: it
+  runs `board_poe_scan_task`, then re-asserts the software-LED enable bits from
+  `gled_mode_flag`. **LAN mode disables SW control on all three LED entities**
+  (hardware scan engine drives them); **PoE mode enables SW control on entities
+  0 and 1**.
+- In PoE mode (`board_poe_led`, `custom.ko` 0xfc0, fed by the BCM59111 status
+  read): **green steady = delivering power, amber steady = fault, both dark =
+  searching or disabled**. No class, no power level. Latched with
+  `rtk_led_swCtrl_start`.
+- Edge case: if userspace has forced all port LEDs off (mode 7), one press
+  restores `gled_mode_last`. For any other mode value (2,3,4,5,6,8,9) the press
+  does nothing.
+
+**The registers**, from the RTL8390 register-descriptor table in `rtk.ko`
+`.data` — this is the bit you'd actually need:
+
+```
+LED_SW_P_EN_CTRL = 0x012C + (port/10)*4   3 bits/port, one per LED entity
+                                          set = SW control, clear = HW scan
+LED_SW_P_CTRL    = 0x0144 + port*4        [2:0] copper ent0 = GREEN
+                                          [5:3] copper ent1 = AMBER
+                                          [8:6] copper ent2
+                                          [11:9]/[14:12]/[17:15] fiber
+                                          0=off, 1-6=blink 32/64/128/256/512/1024 ms, 7=on
+LED_SW_CTRL      = 0x0128 bit 0           latch
+```
+
+Userspace gets at it via **ioctl 1098 (get) / 1099 (set)**
+(`sal_swctrl_poe_led_mode_{get,set}`). The hidden CLI
+`mphiddenled port (green|amber|off|auto|linkAct|linkSpeed)` pins the enum:
+auto=0, green=2, amber=3, off=7, linkAct=8, linkSpeed=9 — **`1` = PoE is
+deliberately not exposed**, it's the button's mode only.
+
+**No persistence:** `board_led_mode_init` zeroes `gled_mode_flag` on every
+module load, nothing is written to SYSINFO/BDINFO/JFFS2, and the web UI doesn't
+expose it. Stock resets to LAN on every boot — so an OpenWrt implementation
+that persists the mode isn't breaking any vendor contract.
+
+**Three corrections to things I'd previously written**, since I'd rather not
+leave them lying around: I had `board_swctrl_poe_led_mode_set` writing per-port
+LED registers at `0x2BC + macId*4`. That was wrong three ways — `0x2BC +
+macId*4` is `MAC_FORCE_MODE_CTRL` (the same one OpenWrt calls
+`RTL839X_MAC_FORCE_MODE_CTRL`), the write is mode-independent and just clears
+bit 0 with `ioal_mem32_field_write(unit, addr, 0, 1, 0)`, and it's skipped
+entirely on the RTL8396M (`beq` against chip id `0x83966800`). The normal button
+toggle doesn't call that function at all.
+
+**What I couldn't work out**, stated plainly: where `LED_GLB_CTRL` /
+`LED_SET_*` / `COPR_SET_SEL` get programmed for this board — no vendor module
+writes them and they're not in the U-Boot source — so I **can't** give you the
+exact LAN-mode blink semantics. I also don't know the physical left/right LED
+positions, whether the handler fires on press or release, or why
+`MAC_FORCE_MODE_CTRL` bit 0 is touched at all. And one thing I can't reconcile:
+at boot the code drives RTL8231 pin 4 HIGH while the flag says LAN, yet HIGH is
+the PoE value on the 8396M. Either the boot path is inconsistent with the
+handler or I've got the polarity backwards.
+
+Happy to share the full disassembly notes if anyone wants to build on this.
+
 ## One defect of my own, for completeness
 
 On a live unit running my image, `lan25`/`lan26` don't exist as netdevs — I

@@ -78,6 +78,21 @@ puts the LM63 on a separate `i2c-gpio-2`; on real hardware there is only
 `i2c-gpio-0`, carrying `0-0020` and `0-004c` and nothing else. Offered as a
 correction.
 
+**4. The LED Mode button — what it actually does, at register level.**
+hmartin asked svanheule about this button in the thread and the answer was
+that `BTN_0` is not wired up by any standard script and that port LEDs via the
+hardware peripheral are not really supported. The semantics have never been
+written down. We recovered them from the vendor firmware: a press only toggles
+a flag, and a 1 Hz thread re-asserts the software-LED enable bits from it —
+LAN mode hands all three LED entities back to the hardware scan engine, PoE
+mode takes software control of entities 0 and 1 and shows **green steady =
+delivering, amber steady = fault, dark = searching/disabled**. The registers
+(`LED_SW_P_EN_CTRL`, `LED_SW_P_CTRL`, `LED_SW_CTRL`), the blink encoding and
+the vendor ioctls are all in
+[`docs/UPSTREAM-STATUS.md`](docs/UPSTREAM-STATUS.md).
+**We are not offering a patch for this — we have not implemented it.** It is
+written down so that whoever does, can.
+
 ## The patches
 
 A two-patch series. **They are independently applicable**: patch 1 is the
