@@ -22,8 +22,12 @@ OpenWrt device support for the **Open Mesh S24v3** (also sold as the **Datto Net
 >   <https://github.com/halmartin/avalon-l2switch-realtek-rtk8382> — *"GPL
 >   source code for the Datto E8, E24v3, and E48 switches"*, also linked from
 >   the OpenWrt wiki GPL archive page. **We did our reverse engineering by
->   disassembling vendor binaries without knowing it existed.** Start there,
->   not with our disassembly.
+>   disassembling vendor binaries without knowing it existed.**
+>   **But the archive is incomplete** — it has U-Boot and a near-vanilla
+>   kernel, and *not* the fan init, the PoE stack or the board configuration.
+>   For those three, disassembly is still the only source. See
+>   [`docs/UPSTREAM-STATUS.md`](docs/UPSTREAM-STATUS.md) before you clone
+>   553 MB.
 >
 > **So this repo is not a competing port.** It is a set of findings and fixes
 > offered *into* that effort. The full picture — who is doing what, what we got
@@ -214,15 +218,29 @@ Short version — the long version, including the `.bix` container format and re
 2. TFTP an OpenWrt `initramfs-kernel` image into RAM and `bootm` it.
 3. From the running initramfs, `sysupgrade` the `squashfs-sysupgrade.bin`.
 
-The stock loader validates the uImage magic word (the board ID) and two CRCs.
-There is no cryptographic signature, so a correctly stamped OpenWrt image boots
-under the unmodified stock bootloader. The family:
+The stock loader **definitely validates the header CRC and the payload CRC**,
+and there is **no cryptographic signature** anywhere in the boot or TFTP-upgrade
+path — which is why a correctly built OpenWrt image boots under the unmodified
+stock bootloader. The magic word is a per-board identifier which we set to
+match; **whether the shipped loader actually enforces it is unverified** (the
+GPL source compiles `image_check_magic()` out by default, and we have never
+deliberately flashed a wrong one). The family:
 
 | Device | `UIMAGE_MAGIC` |
 |---|---|
 | E24v3 | `0x00702202` |
 | E48 | `0x00702201` |
-| S24-L / L24 | `0x00702400` |
+\1
+> **Warning, and it is not a small one:** `boota` **erases 4 KB — the image
+> header — from a partition that fails to boot**, and flips the
+> active-partition selector. That is confirmed in the GPL source
+> (`common/cmd_bootm.c:1660-1663`). One failed attempt destroys that slot's
+> image. Know this before experimenting.
+
+We cannot explain the magic *encoding*: the vendor U-Boot documents the field
+as a Chip/Vendor/Product bitfield, and our values do not fit it. The values are
+read from real flash dumps and corroborated by hmartin's hexdump in the thread;
+the scheme behind them is Senao's and we are not going to guess at it.
 
 **A stock-web-UI-flashable factory image should be possible** and is the better
 install path. svanheule pointed hmartin at the **Zyxel GS1900 recipes** as the

@@ -27,12 +27,32 @@ Datto S24-L uses `0x00702400`; `datto_l8` uses the same mechanism.)
 
 ### There is no signature
 
-**U-Boot validates the magic word and the two CRCs. That is all.** There is no
-cryptographic signature and no vendor key anywhere in the boot path.
+**U-Boot validates the header CRC and the payload CRC. There is no
+cryptographic signature and no vendor key anywhere in the boot path**, nor in
+the TFTP upgrade path (`cmd_upgrade.c:339-350` checks header CRC then data
+CRC). That is confirmed in the vendor GPL source, not merely observed.
 
 That is the whole reason this port is possible against an unmodified stock
-bootloader: an OpenWrt `uImage` stamped with the right magic is indistinguishable
-from a vendor image as far as the loader is concerned.
+bootloader: an OpenWrt `uImage` with valid CRCs is indistinguishable from a
+vendor image as far as the loader is concerned.
+
+**On the magic word specifically, we are less certain than we used to claim.**
+`include/image.h:192-196` and `:485-492` compile `image_check_magic()` out
+unless `CONFIG_ENABLE_IH_MAGIC_NUMBER_CHK` is defined, and that symbol appears
+nowhere in the GPL archive — so *in that source* the magic check is a no-op
+returning 1. We have never deliberately flashed a wrong magic on hardware, so
+whether the shipped loader enforces it is **unverified**. We stamp the matching
+value anyway: it costs nothing and it keeps the image honest about what board
+it is for.
+
+We also cannot explain the encoding. `image.h:178-190` documents the field as
+[b31..b12] Chip ID / [b11..b04] Vendor ID / [b03..b00] Product ID, set from
+`CONFIG_IH_MAGIC_NUMBER` — the archive's one real example is `83800000`, the
+RTL8380 chip ID. Our values do not fit: `0x00702202` would give a chip ID of
+`0x00702`, which is not a Realtek chip ID and is identical across two SoC
+families. Senao appears to have repurposed the field. The **values** are read
+from real flash dumps and corroborated by a hexdump posted in the OpenWrt forum
+thread; the scheme behind them is not ours to explain.
 
 ### Stamping an OpenWrt image
 
@@ -66,8 +86,9 @@ Stock U-Boot 2011.12
         v
    selects RUNTIME1 (0x5a0000) or RUNTIME2 (0x12d0000)
         |
-        |  checks magic == 0x00702202
         |  checks header CRC, checks payload CRC
+        |  (magic: a per-board identifier we match; whether the
+        |   shipped loader enforces it is unverified - see above)
         v
    decompresses and boots the kernel
 ```
@@ -118,9 +139,23 @@ rewritten and both CRCs are checked before boot.
 2. TFTP a known-good `initramfs-kernel` into RAM and `bootm` it.
 3. `sysupgrade` again from there.
 
-**If the loader rejects the image** (bad magic or failed CRC), it will say so —
-that is a stamping or transfer problem, not a dead board. Re-check
-`UIMAGE_MAGIC` and re-transfer.
+**If the loader rejects the image** (failed CRC, or a magic mismatch if this
+loader does enforce it), it will say so — that is a stamping or transfer
+problem, not a dead board. Re-check `UIMAGE_MAGIC` and re-transfer.
+
+> **But know what a failed boot costs you.** The vendor GPL source,
+> `common/cmd_bootm.c:1660-1663`, does this when a partition fails to boot:
+>
+> ```c
+> /* Erase image header when it is crash */
+> eraseFlash(PARTITION_ADDR_0, 0x1000);
+> ```
+>
+> followed by *"Boot from partition %d failed. Try to boot from partition %d"*.
+> **`boota` erases 4 KB — the image header — from the failing slot and flips
+> the active-partition selector.** One failed attempt is enough to destroy that
+> slot's image. Keep a known-good image and a TFTP path available before you
+> experiment.
 
 **If you still have a stock image in the other RUNTIME slot**, `boota <idx>`
 rewrites SYSINFO and boots it. Note that this is only available if you have not

@@ -50,9 +50,10 @@ idea this existed. Every board fact in `docs/HARDWARE.md` and `docs/POE.md` was
 recovered the hard way — from `custom.ko` `.rodata`, from the vendor `initd`,
 from `libcustom.so.0` — when a source archive was sitting in public the whole
 time. That was our mistake, and anyone picking this work up should start from
-the archive, not from our disassembly. (Note the archive's own caveat: the
-drop is incomplete and does not build as shipped, so the disassembly-derived
-facts here still have some value as corroboration.)
+the archive **for the bootloader and kernel** — but see "What the GPL archive
+actually contains" below before cloning it: the drop is incomplete, and the
+fan init, the PoE stack and the board configuration are **not** in it. For
+those, disassembly is still the only route.
 
 ## Where that leaves this repository
 
@@ -233,6 +234,124 @@ firmware's own partition listing — quoted in the thread — gives SYSINFO as
 We may well be missing something about how that region is used. Raising it as a
 question for someone who knows the platform, not as an accusation.
 
+## What the GPL archive actually contains — read this before cloning 553 MB
+
+We mined it. **It is incomplete**, and knowing that up front saves everyone a
+large clone and a wasted afternoon.
+
+- It ships only `u-boot-2011.12/` and a near-vanilla `kernel/uClinux/`.
+- Its own top-level Makefile shows the real build had four components:
+  `KERNEL_DIR`, `LOADER_DIR`, `SDK_DIR` and `TURNKEY_DIR`. **The last three are
+  absent.**
+- `kernel/uClinux/user/switch/` contains only a Makefile. `arch/mips/` has
+  `Kconfig.realtek` but no `realtek/` board directory. Twelve symlinks dangle
+  into a build machine's home directory.
+
+**Consequence: the fan init, the PoE stack and the board configuration are not
+in the archive.** For those three our disassembly remains the only source,
+which is why the findings above still rest on their own evidence rather than on
+the drop.
+
+It does confirm **Senao** as the ODM, and its Makefile names the OEM model
+list: `oms8 oms24 oms48 s24-l s8-l`, plus `p-` and `ps-` variants.
+
+### Confirmed from vendor source
+
+Several things we had inferred from disassembly are now supported by the
+vendor's own code:
+
+- **"SMI group" is genuine Realtek terminology, and group 6 is a free slot.**
+  `board/Realtek/switch/rtk/drv/smi/smi.h:75-87` defines `enum SMI_DEVICE` with
+  eight software-I2C groups, 0-7: SFP1-4, PD64012, SI3452, then
+  `SMI_DEVICE_NONE6` and `SMI_DEVICE_NONE7`. A vendor hanging its PoE MCU off
+  group 6 fits exactly.
+- **Our SCL/SDA argument-order reading was right.** `smi.h:113` declares
+  `drv_smi_init(uint32 portSCK, uint32 pinSCK, uint32 portSDA, uint32 pinSDA,
+  uint32 dev)` — the SCK pair first, then SDA. That validates our decoding of
+  `drv_smi_init(0,13,0,14,6)` as SCL = `gpio0` line 13, SDA = line 14. We had
+  flagged that ordering as unverified; it is now confirmed from vendor source.
+- **The slave address is 7-bit.** `cmd_rtk.c:1267-1268` shows
+  `drv_smi_type_set(type, chipid, delay, index, name)` — chipid and delay are
+  per-group runtime parameters — and `smi.h:37` documents a chipid as a 7-bit
+  value. Consistent with our 0x20.
+- **The boot-partition selector lives in SYSINFO, not the U-Boot
+  environment.** `include/turnkey/sysinfo.h:39-46` names `bootpartition`,
+  `dualfname0`, `boardid`, `flsheras`, `pwdrecov`, `factdflt` and `resetdflt`.
+- **Dual-image geometry matches ours.** A leftover Senao `.config.old` carries
+  `CONFIG_DUAL_IMAGE=y`, `CONFIG_DUAL_IMAGE_PARTITION_SIZE=0xD30000`,
+  `CONFIG_ENV_OFFSET=0x80000`, `CONFIG_BOOTCOMMAND="boota"` and
+  `CONFIG_FLASH_LAYOUT_TYPE4=y`.
+- **No cryptographic signature anywhere.** The boot path checks
+  magic / header-CRC / data-CRC / arch only, and the TFTP upgrade path
+  (`cmd_upgrade.c:339-350`) checks the header CRC then the data CRC. No RSA and
+  no SHA in either.
+
+### Operational warning: a failed boot destroys that slot's header
+
+This was an inference before; it is now fact. `common/cmd_bootm.c:1660-1663`:
+
+```c
+/* Erase image header when it is crash */
+eraseFlash(PARTITION_ADDR_0, 0x1000);
+```
+
+followed by *"Boot from partition %d failed. Try to boot from partition %d"*.
+
+**`boota` erases 4 KB — the image header — from a partition that fails to
+boot, and flips the active-partition selector.** One failed attempt is enough.
+Anyone experimenting with images on these boards should know that before they
+start, not after.
+
+### The `.bix` magic: the values are solid, the encoding is not ours to explain
+
+`include/image.h:178-190` documents the magic as a bitfield — [b31..b12] Chip
+ID (20 bits), [b11..b04] Vendor ID, [b03..b00] Product ID — set from Kconfig as
+`CONFIG_IH_MAGIC_NUMBER`. That is why a forum contributor could not find
+`0x00702201` as a literal anywhere in the source: it is a build-time symbol,
+not a constant. The one real example in the archive is
+`CONFIG_IH_MAGIC_NUMBER=83800000`, i.e. the RTL8380 chip ID.
+
+**Our values do not fit that scheme.** Read as the documented bitfield, E24v3
+`0x00702202` gives a chip ID of `0x00702`, which is not a Realtek chip ID — and
+it would be identical across two different SoC families. Senao appears to have
+repurposed the field. **We cannot account for the encoding and we are not going
+to guess at it.**
+
+The values themselves are not in doubt:
+
+| Device | `UIMAGE_MAGIC` | How we know |
+|---|---|---|
+| E24v3 | `0x00702202` | read directly from an E24v3 flash dump |
+| E48 | `0x00702201` | hmartin's hexdump of the oms48 image, posted in the thread |
+| S24-L / L24 | `0x00702400` | read from an S24-L flash dump |
+
+### Correction: we should not have said "the bootloader validates the magic"
+
+We wrote that, and it is not supported. `image.h:192-196` and `:485-492` show
+`image_check_magic()` compiled out unless `CONFIG_ENABLE_IH_MAGIC_NUMBER_CHK`
+is defined — and **that symbol appears nowhere in the archive**, so as shipped
+in this source the check is a no-op that returns 1.
+
+What we can say: **the header CRC and the data CRC are definitely validated.**
+The magic is a per-board identifier which we set to match, and **whether the
+shipped bootloader enforces it is unverified** — we have never deliberately
+flashed a wrong magic. This source defaulting to not checking it is not the
+same thing as the device not checking it, and we are not going to claim either.
+
+### Two data points for whoever takes on SFP+
+
+- **This SDK snapshot has no 10G support at all.** The SerDes mode enum tops
+  out at 5G / QSGMII / HiSGMII, and `RTL8295` / `8295R` gets zero hits
+  archive-wide. The E24v3's 10G path is beyond this SDK version entirely, so
+  the GPL drop is not a research route for it.
+- **MAC IDs 24 and 36 are a real per-board difference, not a typo of ours.**
+  The sibling 1G-fibre board file
+  `rtl8382m_8218b_intphy_8218b_2fib_1g_demo_board.c` places its two fibre ports
+  at mac_id **24 and 26**, which matches the L24 / S24-L. The E24v3's **24 and
+  36** is genuinely different — and it is confirmed on two units plus the stock
+  U-Boot log. Worth stating, because 26 vs 36 is exactly the kind of thing a
+  reviewer assumes is a mistake.
+
 ## Forum-derived corrections to our own documentation
 
 These came out of the thread and supersede what we had written:
@@ -266,8 +385,10 @@ These came out of the thread and supersede what we had written:
   | S24-L / L24 | `0x00702400` |
 
   The container is a standard U-Boot legacy uImage with the magic word
-  replaced. There is **no cryptographic signature** — only the magic, the
-  header CRC and the payload CRC.
+  replaced by a per-board identifier. There is **no cryptographic signature**;
+  the **header CRC and payload CRC** are what is definitely validated, and
+  whether the shipped loader enforces the magic is unverified — see the
+  archive section above.
 - **svanheule's guidance on images**, answering hmartin directly: the **Zyxel
   GS1900 recipes** are the pattern to follow — the initramfs/factory image must
   stay within the original `0xd30000` partition, while the sysupgrade image may
@@ -294,6 +415,8 @@ hardware first.
    the gap between our A/B result and your cold-boot symptom.
 2. A decision on where the PSE port map is corrected — DTS or driver. We are
    happy either way; it just cannot be both.
-3. A second opinion on the `u-boot-env2` / sysinfo size.
+3. A second opinion on the `u-boot-env2` / sysinfo size — the more so now
+   that the GPL source confirms SYSINFO carries the boot-partition selector
+   (`include/turnkey/sysinfo.h:39-46`), so its geometry is not cosmetic.
 4. Confirmation of the naming we should realign to, so we only re-validate on
    hardware once.

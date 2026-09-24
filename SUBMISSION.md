@@ -17,11 +17,16 @@ from **svanheule** and hardware testing from **stevewaffler**.
   <https://github.com/halmartin/openwrt/tree/rtl83xx-datto>, including
   `target/linux/realtek/dts/rtl8396_datto_e24.dts`. As of 26 Mar 2026 he
   reported copper, PoE, fans and LEDs working, SFP/SFP+ still WIP.
-- A **GPL source archive for these exact devices already exists**:
+\1
   <https://github.com/halmartin/avalon-l2switch-realtek-rtk8382> - *"GPL source
   code for the Datto E8, E24v3, and E48 switches"*, also linked from the
   OpenWrt wiki GPL archive page. **Our reverse engineering was done by
-  disassembling vendor binaries without knowing it existed.**
+  disassembling vendor binaries without knowing it existed.** The archive is
+  incomplete, though — it carries U-Boot and a near-vanilla kernel, but not the
+  fan init, the PoE stack or the board configuration, so for those three the
+  disassembly is still the only source. What it *does* independently confirm
+  (and the two claims of ours it forced us to correct) is set out in
+  `docs/UPSTREAM-STATUS.md`.
 
 **Treat this series as findings and fixes offered into that effort**, not as a
 competing port. If a maintainer would rather see these changes land in
@@ -249,7 +254,14 @@ produces the identical set. Nothing is introduced by this board.
    shared bit-banged bus, \1 The topology is well attested: a second unit's stock
    U-Boot log prints `### RTL8295R config - MAC ID = 24 ###` and
    `### RTL8295R config - MAC ID = 36 ###`, matching our table, the boot log
-   quoted in the forum thread, and both units.
+\1 The vendor GPL source makes it more
+   than a coincidence: the sibling 1G-fibre board file
+   `rtl8382m_8218b_intphy_8218b_2fib_1g_demo_board.c` puts its two fibre ports
+   at mac_id **24 and 26** (matching the L24 / S24-L), so the E24v3's **24 and
+   36** is a genuine per-board difference rather than a transcription error.
+   Note also that this SDK snapshot has **no 10G support at all** — the SerDes
+   mode enum tops out at 5G/QSGMII/HiSGMII and `RTL8295R` gets zero hits
+   archive-wide — so the GPL drop is not a research route for these cages.
 2. **The fan curve values are replicated, not understood.** Patch 2 programs
    them and automatic fan control works, but the exact temperature and
    duty-cycle semantics of the vendor LUT are unconfirmed — see "The fan
@@ -362,7 +374,34 @@ warning in a comment next to the mapping. If the maintainers would rather fix it
 in the driver, that is a reasonable call and this DTS section becomes a plain
 1:1 list.
 
-### 3b. `u-boot-env2` / sysinfo size - a question, not an accusation
+### 3a. Two corrections we owe you, from mining the vendor GPL source
+
+Recorded here because both make our own earlier statements weaker:
+
+1. **We should not have said the bootloader "validates the magic word".**
+   `include/image.h:192-196` and `:485-492` compile `image_check_magic()` out
+   unless `CONFIG_ENABLE_IH_MAGIC_NUMBER_CHK` is defined, and that symbol
+   appears nowhere in the archive — so as shipped in that source the check is a
+   no-op returning 1. What is definitely validated is the **header CRC and the
+   data CRC**; the magic is a per-board identifier we set to match, and whether
+   the shipped loader enforces it is **unverified**. `UIMAGE_MAGIC` stays as it
+   is either way, since matching costs nothing.
+2. **We are not going to explain the magic's encoding.** `image.h:178-190`
+   documents it as [b31..b12] Chip ID / [b11..b04] Vendor ID / [b03..b00]
+   Product ID, set from `CONFIG_IH_MAGIC_NUMBER` (the archive's one real
+   example is `83800000`, the RTL8380 chip ID). Our values do not fit: E24v3
+   `0x00702202` would give a chip ID of `0x00702`, which is not a Realtek chip
+   ID and is identical across two SoC families. Senao evidently repurposed the
+   field. The **values** are solid — `0x00702202` read from an E24v3 flash dump,
+   `0x00702201` from hmartin's posted hexdump of the oms48 image — but the
+   scheme is not something we can account for.
+
+And one operational fact worth a reviewer's attention, now confirmed from
+source rather than inferred: `common/cmd_bootm.c:1660-1663` erases 4 KB (the
+image header) from a partition that fails to boot, and flips the
+active-partition selector. A single failed boot destroys that slot's image.
+
+\1
 
 The merged L8 DTS and hmartin's E24 both declare the `u-boot-env2` / sysinfo
 partition as `reg = <0x90000 0x20000>`. That runs to `0xb0000` and therefore

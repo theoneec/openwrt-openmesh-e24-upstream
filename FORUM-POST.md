@@ -188,9 +188,11 @@ I take as a decent cross-check on both:
 - The root-shell recipe from this thread (`rdinit=/bin/sh`, unquoted
   `bootargs`, then `rm /bin/cli` and `/etc/rc`) supersedes what I'd written
   about the console being owned by a login prompt. Thank you.
-- `.bix` magic family, for the record: E24v3 `0x00702202`, E48 `0x00702201`,
-  S24-L/L24 `0x00702400`. Standard U-Boot legacy uImage with the magic word
-  replaced; no cryptographic signature, just magic + header CRC + payload CRC.
+- `.bix` magic family, for the record: E24v3 `0x00702202` (read from a flash
+  dump), E48 `0x00702201` (@hmartin's own hexdump, posted upthread), S24-L/L24
+  `0x00702400`. Standard U-Boot legacy uImage with the magic word replaced; no
+  cryptographic signature in either the boot path or the TFTP upgrade path —
+  header CRC and data CRC only. See the correction below on the magic itself.
 - A second unit's stock U-Boot log prints
   `### RTL8295R config - MAC ID = 24 ###` and
   `### RTL8295R config - MAC ID = 36 ###`, which matches the boot log quoted
@@ -209,6 +211,75 @@ I take as a decent cross-check on both:
 - @stevewaffler's inverted power LED on the E24v3 reproduces here in effect —
   `/sys/class/leds/green:sys/brightness` has to be `0` for solid on. Not fixed
   in my tree yet either.
+
+## 7. I mined the GPL archive — save yourselves the 553 MB clone
+
+@hmartin, I went through your GPL drop properly. Three things worth posting.
+
+**It is incomplete, in a specific way.** It has `u-boot-2011.12/` and a
+near-vanilla `kernel/uClinux/`. Its own top-level Makefile shows four
+components — `KERNEL_DIR`, `LOADER_DIR`, `SDK_DIR`, `TURNKEY_DIR` — and the
+last three aren't there. `user/switch/` is just a Makefile, `arch/mips/` has
+`Kconfig.realtek` but no `realtek/` board directory, and a dozen symlinks
+dangle into someone's home dir. **So the fan init, the PoE stack and the board
+config are not in it** — which is why I was still disassembling. Anyone hoping
+to find the PoE remap opcodes in there will be disappointed.
+
+**It does confirm several things I'd only inferred**, and I'd rather cite the
+source than my disassembly:
+
+- `drv/smi/smi.h:75-87` defines `enum SMI_DEVICE` with eight software-I2C
+  groups 0-7 (SFP1-4, PD64012, SI3452, then `SMI_DEVICE_NONE6`/`NONE7`) — so
+  "SMI group 6" is real Realtek terminology and a free slot, exactly where
+  you'd hang a PoE MCU.
+- `smi.h:113`: `drv_smi_init(portSCK, pinSCK, portSDA, pinSDA, dev)` — SCK pair
+  first. That confirms my reading of `drv_smi_init(0,13,0,14,6)` as SCL =
+  gpio0 line 13, SDA = line 14, which I'd previously flagged as unverified.
+- `smi.h:37` + `cmd_rtk.c:1267-1268`: the chipid is a 7-bit value. Consistent
+  with 0x20.
+- `include/turnkey/sysinfo.h:39-46` confirms the boot-partition selector lives
+  in SYSINFO (`bootpartition`, `dualfname0`, `boardid`, `flsheras`, …), not the
+  U-Boot env — which is another reason the SYSINFO geometry question above is
+  worth settling.
+- A leftover Senao `.config.old`: `CONFIG_DUAL_IMAGE=y`,
+  `CONFIG_DUAL_IMAGE_PARTITION_SIZE=0xD30000`, `CONFIG_ENV_OFFSET=0x80000`,
+  `CONFIG_BOOTCOMMAND="boota"`, `CONFIG_FLASH_LAYOUT_TYPE4=y`.
+
+**And it forced two corrections on me, plus one warning everyone should have.**
+
+*Warning first:* `common/cmd_bootm.c:1660-1663` —
+`/* Erase image header when it is crash */ eraseFlash(PARTITION_ADDR_0, 0x1000);`
+then *"Boot from partition %d failed. Try to boot from partition %d"*. **`boota`
+erases 4 KB — the image header — from a slot that fails to boot, and flips the
+selector.** One bad attempt and that slot's image is gone. I had this as an
+inference; it's now source.
+
+*Correction 1:* I said the loader "validates the magic word". **I shouldn't
+have.** `image.h:192-196` and `:485-492` compile `image_check_magic()` out
+unless `CONFIG_ENABLE_IH_MAGIC_NUMBER_CHK` is defined, and that symbol appears
+nowhere in the archive — so in this source it's a no-op returning 1. What's
+definitely checked is the header CRC and the data CRC. Whether the *shipped*
+bootloader enforces the magic, I don't know, and I've never deliberately
+flashed a wrong one. Matching it costs nothing, so I still do.
+
+*Correction 2:* whoever it was upthread who couldn't find `0x00702201` as a
+literal in the source — you were right, it isn't one. `image.h:178-190`
+documents the magic as a bitfield ([b31..b12] Chip ID, [b11..b04] Vendor ID,
+[b03..b00] Product ID) set from `CONFIG_IH_MAGIC_NUMBER`; the archive's one
+real example is `83800000`, the RTL8380 chip ID. **But our values don't fit
+that scheme** — `0x00702202` would mean a chip ID of `0x00702`, which isn't a
+Realtek chip ID and would be identical across two different SoC families. Senao
+seems to have repurposed the field. The values are solid (I read `0x00702202`
+off an E24v3 dump; your oms48 hexdump gives `00 70 22 01`); the encoding I
+can't account for and won't invent.
+
+Finally, two things for the SFP+ work: this SDK snapshot has **no 10G support
+at all** (SerDes mode enum stops at 5G/QSGMII/HiSGMII, `RTL8295R` zero hits
+archive-wide), so the drop won't help there. And the sibling
+`rtl8382m_8218b_intphy_8218b_2fib_1g_demo_board.c` puts its two fibre ports at
+mac_id **24 and 26** — matching the L24/S24-L — which makes the E24v3's **24
+and 36** a real per-board difference rather than a typo on my part, as it
+probably looks.
 
 ## One defect of my own, for completeness
 
