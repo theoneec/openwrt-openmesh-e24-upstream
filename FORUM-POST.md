@@ -358,6 +358,89 @@ handler or I've got the polarity backwards.
 
 Happy to share the full disassembly notes if anyone wants to build on this.
 
+## 9. An intermittent PoE status-read failure I could not root-cause
+
+Posting this characterised rather than solved, because the four things I ruled
+out are probably worth more to the next person than my remaining guess.
+
+**PoE delivery is fine.** Power is detected, classified and delivered. This is
+status reporting only — please don't read it as PoE being broken.
+
+`ethtool --show-pse lanN` intermittently fails with "netlink error: No error
+information". Downstream that means `ubus call luci.poe status` and the LuCI
+page show 1-2 ports per call with blank admin/detection/class, `limit_mw: -1`,
+`priority: -1`, and the `poe` CLI prints `?`.
+
+E24v3, r36407-14651b9683, kernel 6.18.52:
+
+- **1.7-7% of calls fail with the CPU idle**, varying between runs (~1,200
+  calls over several sessions).
+- **0 failures in 240 calls with both CPUs loaded.** Against that session's
+  idle rate that's p≈1.6%; against the pooled idle rate (~4.5%), p≈1.6e-5. Load
+  really does eliminate it.
+- **It tracks the number of calls, not time or rate** — tight loop 4.2%/call at
+  ~10/min, `sleep 1` pacing 7.1%/call at ~3.4/min. Independent per-transaction
+  failure probability.
+- No port affinity (18 distinct ports across 480 calls, worst port 3 times),
+  bursty in time, **10/10 immediate same-port retries succeeded**, kernel
+  silent throughout.
+
+One caveat before anyone quotes that percentage at me: a single
+`ethtool --show-pse` does several MCU requests internally (admin, detection,
+class, power, limit, priority), so the per-*request* rate is roughly the
+per-call rate over that count. The headline number overstates the real
+transaction error rate.
+
+**What I ruled out, and how:**
+
+1. **LM63 contention** — the obvious suspect, since the LM63 shares the one
+   bit-banged bus with the PSE MCU. Varying `update_interval` (62/8000/125 ms)
+   gave 5/8/5 failures per 120: flat. **But I'll be honest that the test was
+   structurally weak** — `lm63` is lazy cache-on-read with no timer, so with
+   nothing reading its sysfs it barely touches the bus whatever the interval.
+   Flat result *and* a near-null experiment. A proper test would hammer the
+   LM63 sysfs concurrently.
+2. **MCU staleness / sequence desync** — 10/10 immediate retries succeeded, so
+   no persistent desync, no per-port cascade.
+3. **Pacing** — tight loop 10/240 vs `sleep 1` 17/240. The paced arm was
+   *worse*. Pacing doesn't help.
+4. **CPU frequency scaling** — the `userspace` governor pins 700 MHz idle or
+   loaded (`cpufreq-dt`, 425-750 MHz), so DVFS can't explain idle-vs-loaded.
+
+**Driver context**, from the in-tree source, since it shapes the failure: the
+PSE core holds a mutex across send -> `msleep(RTPSE_MCU_RESPONSE_MS)` (25 ms)
+-> recv, so PSE requests can't interleave with each other. It does *not* lock
+the i2c adapter — not the cause here, but relevant for boards sharing the bus
+more actively. And a sequence/opcode/checksum mismatch returns `-EBADMSG`
+immediately with no retry; only an explicit MCU `NOT_READY` is re-sent. So one
+corrupted transfer is a hard failure, not something the driver rides out.
+
+**My leading hypothesis, and it is only that.** `/proc/cpuinfo` says
+`wait instruction: yes`, and this build exposes **no cpuidle framework at all**
+(`/sys/devices/system/cpu/cpuidle/` doesn't exist), so the idle loop is most
+likely `r4k_wait`. Wake latency out of that state could perturb the timing of
+the software bit-banged i2c-gpio transfers, corrupt a byte and trip the
+checksum/sequence check — an immediate hard failure per the above. It fits
+every measurement, including the ones that killed the other four: per
+transaction rather than per unit time, gone under load (a busy CPU never
+idles), no port affinity, clears on retry.
+
+**I have not tested it.** With no cpuidle sysfs I can't toggle it at runtime —
+it needs a kernel/cmdline change (the MIPS `nowait` parameter, if it's honoured
+here) and a reboot. If anyone already knows whether `r4k_wait` wake latency can
+realistically disturb `i2c-gpio` on rtl839x, that would save me the experiment.
+
+**Things someone might evaluate** (none tried, none a fix): a PM QoS latency
+request around the bit-bang transfers; moving the PoE MCU to a hardware I2C
+controller if the SoC has one on those pins; or retrying on `-EBADMSG` in the
+PSE driver, given it demonstrably clears on immediate retry.
+
+**Two practical notes if you reproduce this.** BusyBox on these images has no
+`nohup`, no fractional `sleep`, no `usleep`, and `read -t` rejects fractional
+timeouts — pace from another host or use integer sleeps. And writing hwmon
+`update_interval` *also* reprograms the LM63 conversion-rate register `0x04`,
+so it isn't purely a driver-side knob.
+
 ## One defect of my own, for completeness
 
 On a live unit running my image, `lan25`/`lan26` don't exist as netdevs — I

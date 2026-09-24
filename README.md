@@ -201,6 +201,48 @@ Validated on a real unit, booted from flash:
 > a 410 W PoE chassis. If you apply `0001` alone, program a fan curve yourself
 > before putting the switch under load.
 
+### Known issue: intermittent PoE **status-read** failure — cause undetermined
+
+**PoE delivery is unaffected. Power works.** This is a status-reporting bug and
+nothing else — do not read it as "PoE is broken on this board".
+
+`ethtool --show-pse lanN` intermittently fails with
+*"netlink error: No error information"*. What you see downstream:
+`ubus call luci.poe status` and the LuCI PoE page show 1-2 ports per call with
+blank admin/detection/class, `limit_mw: -1` and `priority: -1`, and the `poe`
+CLI prints `?` for those ports. The next call is usually fine.
+
+Measured on a Datto E24v3, OpenWrt r36407-14651b9683, kernel 6.18.52,
+`realtek/rtl839x`:
+
+| Observation | Figure |
+|---|---|
+| Per-call failure rate, CPU idle | **1.7% - 7%**, varying between runs (~1,200 calls over several sessions) |
+| Per-call failure rate, both CPUs loaded | **0 failures in 240 calls** |
+| Tight loop | 4.2%/call, ~10 failures/min |
+| One-second pacing | 7.1%/call, ~3.4 failures/min |
+| Port affinity | none — 18 distinct ports failed across 480 calls; worst port 3 times, most once |
+| Immediate same-port retry | **10 of 10 succeeded** |
+| Kernel log | silent |
+
+Two things that follow from those numbers. **Load genuinely eliminates the
+failures** — at that session's idle rate (1.7%) the chance of seeing zero in
+240 calls is ~1.6%, and against the pooled idle rate (~4.5%) it is ~1.6e-5.
+And **failures track the number of calls, not elapsed time or call rate**,
+which is the signature of an independent per-transaction failure probability.
+Failures are bursty in time but not on a port.
+
+**Caveat on the headline percentage:** one `ethtool --show-pse` performs
+*several* MCU requests internally (admin, detection, class, power, limit,
+priority), so the per-*request* failure rate is roughly the per-call rate
+divided by that count. The percentages above **overstate** the underlying
+transaction error rate.
+
+The eliminated hypotheses, the driver context and the one untested lead are in
+[`SUBMISSION.md`](SUBMISSION.md#known-issue-intermittent-poe-status-read-failure--cause-undetermined).
+Four plausible causes are ruled out with experiments, which is the part worth
+reading before anyone repeats them.
+
 ## The PSE port map, in one paragraph
 
 The PSE channel index is `port ^ 3` — each aligned group of four ports is
