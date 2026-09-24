@@ -17,7 +17,7 @@ from **svanheule** and hardware testing from **stevewaffler**.
   <https://github.com/halmartin/openwrt/tree/rtl83xx-datto>, including
   `target/linux/realtek/dts/rtl8396_datto_e24.dts`. As of 26 Mar 2026 he
   reported copper, PoE, fans and LEDs working, SFP/SFP+ still WIP.
-\1
+- A **GPL source archive for these exact devices already exists**:
   <https://github.com/halmartin/avalon-l2switch-realtek-rtk8382> - *"GPL source
   code for the Datto E8, E24v3, and E48 switches"*, also linked from the
   OpenWrt wiki GPL archive page. **Our reverse engineering was done by
@@ -125,7 +125,7 @@ is withdrawn, since the failing PFR 8 is ~22.5 kHz against PFR 31's reported
 genuinely cold boot, so we cannot yet say the power-on default is a failing
 value.
 
-\1
+**Honest caveats, stated in the commit message too:**
 
 - The register values are **replicated verbatim** from the vendor firmware's
   init, in the vendor's order. The precise temperature and duty-cycle semantics
@@ -251,11 +251,12 @@ produces the identical set. Nothing is introduced by this board.
    Everything needed for a future RTL8295R implementation is recorded in the
    DTS and in `docs/HARDWARE.md`: MAC ID 24 (SerDes 8) and MAC ID 36
    (SerDes 12), MIIM port indices 25/26, module EEPROMs at I2C 0x50 on the
-   shared bit-banged bus, \1 The topology is well attested: a second unit's stock
-   U-Boot log prints `### RTL8295R config - MAC ID = 24 ###` and
+   shared bit-banged bus, and the presence/LOS sidebands on the RTL8231
+   expander. The topology is well attested: a second unit's stock U-Boot
+   log prints `### RTL8295R config - MAC ID = 24 ###` and
    `### RTL8295R config - MAC ID = 36 ###`, matching our table, the boot log
-\1 The vendor GPL source makes it more
-   than a coincidence: the sibling 1G-fibre board file
+   quoted in the forum thread, and both units. The vendor GPL source makes
+   it more than a coincidence: the sibling 1G-fibre board file
    `rtl8382m_8218b_intphy_8218b_2fib_1g_demo_board.c` puts its two fibre ports
    at mac_id **24 and 26** (matching the L24 / S24-L), so the E24v3's **24 and
    36** is a genuine per-board difference rather than a transcription error.
@@ -401,7 +402,7 @@ source rather than inferred: `common/cmd_bootm.c:1660-1663` erases 4 KB (the
 image header) from a partition that fails to boot, and flips the
 active-partition selector. A single failed boot destroys that slot's image.
 
-\1
+### 3b. `u-boot-env2` / sysinfo size - a question, not an accusation
 
 The merged L8 DTS and hmartin's E24 both declare the `u-boot-env2` / sysinfo
 partition as `reg = <0x90000 0x20000>`. That runs to `0xb0000` and therefore

@@ -199,7 +199,7 @@ I take as a decent cross-check on both:
   earlier in this thread and the MAC ID / SerDes table in my DTS comments. So
   that topology is confirmed on two units plus the vendor bootloader, if it
   helps the SFP+ work.
-\1, including
+- `libcustom.so.0` has hidden vendor CLI commands, including
   `mphiddenpoe poe power-budget <1-999>` — relevant to the budget discussion,
   since it shows the vendor treats the chassis budget as a settable value with
   no per-unit storage.

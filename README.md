@@ -160,7 +160,8 @@ Validated on a real unit, booted from flash:
   has no mainline driver, so both are declared `status = "disabled"`. This is
   deliberate: a `fixed-link` would make the kernel report an unconditional 10G
   carrier on an empty cage. See `docs/HARDWARE.md` for everything recorded for
-  \1 The topology is well attested: a second unit's stock U-Boot log
+  a future RTL8295R implementation — this is the obvious follow-up
+  contribution. The topology is well attested: a second unit's stock U-Boot log
   prints `### RTL8295R config - MAC ID = 24 ###` and
   `### RTL8295R config - MAC ID = 36 ###`, matching our port table, the boot
   log quoted in the forum thread, and both units.
@@ -230,7 +231,8 @@ deliberately flashed a wrong one). The family:
 |---|---|
 | E24v3 | `0x00702202` |
 | E48 | `0x00702201` |
-\1
+| S24-L / L24 | `0x00702400` |
+
 > **Warning, and it is not a small one:** `boota` **erases 4 KB — the image
 > header — from a partition that fails to boot**, and flips the
 > active-partition selector. That is confirmed in the GPL source
