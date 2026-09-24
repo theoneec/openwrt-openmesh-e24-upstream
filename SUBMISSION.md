@@ -2,6 +2,37 @@
 
 Notes for OpenWrt maintainers reviewing this contribution.
 
+## Before anything else: this is not a standalone port
+
+There is an active, year-old upstream effort covering exactly these devices,
+which we were unaware of while doing this work:
+**[Add support for Datto L8, E24v3, E48 switches](https://forum.openwrt.org/t/add-support-for-datto-l8-e24v3-e48-switches/241657)**
+(*For Developers*, Oct 2025 - Apr 2026), driven by **hmartin**, with review
+from **svanheule** and hardware testing from **stevewaffler**.
+
+- The **Datto L8 is already in mainline**. hmartin's latest L8 change,
+  [openwrt/openwrt#22764](https://github.com/openwrt/openwrt/pull/22764)
+  (*"realtek: fixup Datto L8 device tree"*), merged 3 Apr 2026.
+- hmartin has a WIP branch covering E8 / E24 / E48:
+  <https://github.com/halmartin/openwrt/tree/rtl83xx-datto>, including
+  `target/linux/realtek/dts/rtl8396_datto_e24.dts`. As of 26 Mar 2026 he
+  reported copper, PoE, fans and LEDs working, SFP/SFP+ still WIP.
+- A **GPL source archive for these exact devices already exists**:
+  <https://github.com/halmartin/avalon-l2switch-realtek-rtk8382> - *"GPL source
+  code for the Datto E8, E24v3, and E48 switches"*, also linked from the
+  OpenWrt wiki GPL archive page. **Our reverse engineering was done by
+  disassembling vendor binaries without knowing it existed.**
+
+**Treat this series as findings and fixes offered into that effort**, not as a
+competing port. If a maintainer would rather see these changes land in
+hmartin's branch than as a separate device commit, that is a good outcome and
+we will do the work to get them there.
+
+Three things here appear not to be solved on that branch - the fan-control root
+cause (which the thread explicitly gave up on), the PSE port-map XOR, and the
+single-I2C-bus correction. They are set out below and in
+`docs/UPSTREAM-STATUS.md`.
+
 ## The series
 
 Two patches, **independently applicable**:
@@ -76,7 +107,20 @@ LM63-plus-PSE-MCU pairing, with a bootloader that leaves the chip unconfigured
 in the same way. Adding a branch to that existing file is exactly how this tree
 does per-board fan setup.
 
-**Honest caveats, stated in the commit message too:**
+**One value in that sequence is now experimentally confirmed as causal.**
+With duty held at ~50% and `0x4A` held at `0x2A` (so SCS and bit `0x02` never
+moved), varying **only** `0x4D` on a live unit gave PFR 31 (`0x1F`) → fans run,
+audibly slower than full speed, i.e. partial PWM control working, and PFR 8
+(`0x08`) → fans off; restoring the vendor values brought them back. So
+`0x4D` (`PWM_FREQ` / PFR) determines whether sub-100% duty drives these fans at
+all. We do **not** offer a physical mechanism for that — an earlier explanation
+involving the 74HC123D one-shot timing out at too low a frequency was wrong and
+is withdrawn, since the failing PFR 8 is ~22.5 kHz against PFR 31's reported
+5806 Hz, i.e. four times *higher*. And we have not yet read `0x4D` on a
+genuinely cold boot, so we cannot yet say the power-on default is a failing
+value.
+
+\1
 
 - The register values are **replicated verbatim** from the vendor firmware's
   init, in the vendor's order. The precise temperature and duty-cycle semantics
@@ -202,8 +246,10 @@ produces the identical set. Nothing is introduced by this board.
    Everything needed for a future RTL8295R implementation is recorded in the
    DTS and in `docs/HARDWARE.md`: MAC ID 24 (SerDes 8) and MAC ID 36
    (SerDes 12), MIIM port indices 25/26, module EEPROMs at I2C 0x50 on the
-   shared bit-banged bus, and the presence/LOS sidebands on the RTL8231
-   expander.
+   shared bit-banged bus, \1 The topology is well attested: a second unit's stock
+   U-Boot log prints `### RTL8295R config - MAC ID = 24 ###` and
+   `### RTL8295R config - MAC ID = 36 ###`, matching our table, the boot log
+   quoted in the forum thread, and both units.
 2. **The fan curve values are replicated, not understood.** Patch 2 programs
    them and automatic fan control works, but the exact temperature and
    duty-cycle semantics of the vendor LUT are unconfirmed — see "The fan
@@ -213,32 +259,88 @@ produces the identical set. Nothing is introduced by this board.
    `mtd-concat`'d into one firmware region so kernel + rootfs + overlay fit,
    as the upstream `datto_l8` sibling also does.
 4. **LED-mode button polarity is inferred.** Documented as such in the DTS.
+5. **Our generated network config references non-existent ports - our bug.**
+   Because the SFP+ ports are disabled, `lan25` and `lan26` do not exist as
+   netdevs on a live unit, yet the config we generate still lists them in the
+   bridge VLAN:
+   `network.lan_vlan.ports='lan1 ... lan24 lan25 lan26'`.
+   A bridge VLAN referencing ports that do not exist is wrong and will generate
+   errors. **Known issue, to be fixed before submission.** Not fixed in this
+   pass, which is documentation only.
+6. **Inverted power LED**, reported by stevewaffler on a real E24v3 on 6 Apr
+   2026: it flashes during boot and goes off once booted;
+   `/sys/class/leds/green:sys/brightness` must be `0` for solid on. Open, not
+   addressed here.
+7. **No factory image flashable from the stock web UI.** svanheule pointed
+   hmartin at the Zyxel GS1900 recipes as the pattern - the initramfs/factory
+   image must stay within the original `0xd30000` partition while the
+   sysupgrade image may span the merged firmware partitions. hmartin has
+   demonstrated installing OpenWrt on the L8 straight from the stock web UI
+   with no UART. That is a much better install path than the TFTP procedure
+   documented here, and it is not implemented in this series.
 
 ---
 
 ## Reviewer discussion points (anticipated)
 
-### 1. Naming and `compatible`
+### 1. KNOWN DELTA - naming: ours does not match upstream convention
 
-The unit is branded **Open Mesh S24v3** and **Datto Networking E24v3**; the DTS
-uses `compatible = "openmesh,e24", "datto,e24v3"`, `model = "Open Mesh E24v3"`
-and the recipe uses `DEVICE_VENDOR := OpenMesh` / `DEVICE_MODEL := E24` with
-`DEVICE_ALT0_*` for the Datto branding.
+**This is a known delta, not a position we are defending.** The convention
+established by the merged L8 and followed by hmartin's E24 is `datto,<model>`
+as the primary compatible with Open Mesh as the alt-brand. Ours is inverted.
 
-`openmesh,e24` is the string the hardware-validated build ran with, which is why
-it is what is submitted, but it is arguably the Datto name under the Open Mesh
-vendor prefix. The consistent alternative is `openmesh,s24-v3` — which also
-disambiguates it from the rtl8382 `openmesh,s24`. **Happy to rename to whatever
-the maintainers prefer; it is a pure string change.** Flagging it rather than
-guessing.
+The merged L8:
+
+```
+compatible = "datto,l8", "realtek,rtl838x-soc";
+DEVICE_VENDOR      := Datto
+DEVICE_MODEL       := L8
+DEVICE_ALT0_VENDOR := Open Mesh
+DEVICE_ALT0_MODEL  := S8-L
+```
+
+hmartin's E24, and this series, side by side:
+
+| | hmartin / upstream convention | This series |
+|---|---|---|
+| DTS filename | `rtl8396_datto_e24.dts` | `rtl8391_openmesh_e24.dts` |
+| `compatible` | `"datto,e24v3", "realtek,rtl8396-soc"` | `"openmesh,e24", "datto,e24v3", ...` |
+| `model` | `Datto E24v3` | `Open Mesh E24v3` |
+| Recipe | `Device/datto_e24` | `Device/openmesh_e24` |
+| `SOC` | `rtl8396` | `rtl8391` |
+| `DEVICE_MODEL` | `E24` | `E24` |
+| Alt branding | `DEVICE_ALT0_VENDOR := Open Mesh` / `DEVICE_ALT0_MODEL := S24v3` | Datto in `DEVICE_ALT0_*` (inverted) |
+| `UIMAGE_MAGIC` | `0x00702202` | `0x00702202` (same) |
+| `IMAGE_SIZE` | `13504k` | `13504k` (same) |
+
+Two values already agree - `UIMAGE_MAGIC` and `IMAGE_SIZE` - and were reached
+independently, which is a useful cross-check on both.
+
+**Ours predates our discovery of that convention.** Realignment to
+`datto,e24v3` + `SOC := rtl8396` + the `rtl8396_datto_e24.dts` filename is
+**pending, not refused**.
+
+It is deliberately *not* done in this pass, for one reason: the compatible
+string is what `board_name()` returns, and `board_name()` keys both the
+board-specific **PoE budget table** and the **fan init branch** added by patch
+2. Renaming is therefore a functional change to two runtime paths, and it
+**must be re-validated on hardware before submission**. We would rather
+document the delta honestly than ship an untested rename and have a reviewer
+discover it.
+
+Reviewers should assume the final submission carries the upstream names, and
+review the *substance* rather than the strings.
 
 ### 2. `SOC := rtl8391` for an RTL8396M
 
-The RTL8396M has no dedicated in-tree SoC token. The true part is read from the
-chip-ID register at runtime, so `rtl8391` is used because it matches the closest
-24-port 839x board (`zyxel,gs1920-24hp-v2`) and drives
-`DEVICE_DTS = rtl8391_openmesh_e24`. If a maintainer would rather add an
-`rtl8396` token, that is a separate and welcome change.
+The RTL8396M has no dedicated in-tree SoC token, and `rtl8391` was chosen here
+because it matches the closest 24-port 839x board
+(`zyxel,gs1920-24hp-v2`) and drives `DEVICE_DTS = rtl8391_openmesh_e24`.
+
+**hmartin's branch uses `SOC := rtl8396` and
+`compatible = ..., "realtek,rtl8396-soc"`,** which is the better answer and is
+what we will realign to - subject to the same `board_name()` re-validation
+described above.
 
 ### 3. The PSE port-map XOR — the one that needs a decision
 
@@ -259,6 +361,18 @@ or the two corrections cancel and re-scramble the mapping. The DTS carries that
 warning in a comment next to the mapping. If the maintainers would rather fix it
 in the driver, that is a reasonable call and this DTS section becomes a plain
 1:1 list.
+
+### 3b. `u-boot-env2` / sysinfo size - a question, not an accusation
+
+The merged L8 DTS and hmartin's E24 both declare the `u-boot-env2` / sysinfo
+partition as `reg = <0x90000 0x20000>`. That runs to `0xb0000` and therefore
+overlaps `cfg` at `0xa0000`. The stock firmware's own partition listing, quoted
+in the forum thread, gives SYSINFO as `0x090000`-`0x0a0000`, i.e. **`0x10000`**.
+
+This series uses `0x10000`.
+
+We may be missing something about how that region is used, so this is raised as
+a question for someone who knows the platform rather than as a bug report.
 
 ### 4. The extra `compatible` on the PSE node
 
@@ -283,31 +397,38 @@ are genuinely empty most of the time.
 
 ---
 
-## One observation for a maintainer's eye (not a diagnosis)
+## Two things we noticed and are explicitly NOT claiming are related
 
-On this device `reboot -f` is reliable, while a plain `reboot` hung once.
+Recorded for completeness, not as a bug report. Neither is a claim.
 
-While looking at that, one asymmetry stood out in the target itself. In
+**A warm-reset hang we saw once and cannot reproduce.** On one unit a plain
+`reboot` hung once, while `reboot -f` was reliable. We have since tested a
+second, independent E24v3: a plain `reboot` on it came back cleanly and fast —
+the kernel printed `reboot: Restarting system`, the U-Boot banner appeared
+**1.6 s later**, and it reached userspace in about 37 s. The running tally
+across both units is **one hang in seven warm resets**, not reproducible, and
+on the second unit the exact method that failed once works fine. That is not
+enough to attribute anything to anything.
+
+**An unrelated code asymmetry we noticed while looking at it.** In
 `target/linux/realtek/patches-6.18/300-02-enhance-realtek-board-setup.patch`,
 `rtl838x_apply_early_quirks()` clears `BIT(30)` of `RTL838X_PLL_CML_CTRL` with
-the comment:
+the comment *"Disable 4 byte address mode of flash controller. If this bit is
+not cleared the watchdog cannot reset the SoC."* `rtl838x` is the only SoC
+family in that file with an `.apply_quirks` hook; rtl839x has no equivalent.
 
-> *"Disable 4 byte address mode of flash controller. If this bit is not cleared
-> the watchdog cannot reset the SoC."*
-
-`rtl838x` is the only SoC family in that file with an `.apply_quirks` hook —
-**rtl839x has no equivalent.** Whether rtl839x has the same flash-controller bit,
-whether it matters there, and whether it has anything at all to do with the
-`reboot` hang, are all open questions this contribution is not in a position to
-answer. It is raised purely because a maintainer who knows the SoC will resolve
-it in a minute and it would be wasteful not to mention it.
-
----
+**We have no evidence connecting these two paragraphs**, and we are not
+asserting that the missing rtl839x hook causes anything. We are not asking for
+either to be actioned. They are written down only so that neither is a
+surprise to anyone who later encounters them.
 
 ## Supporting documentation
 
 Not part of the series, but written up for whoever reviews or ports next:
 
+- `docs/UPSTREAM-STATUS.md` — **the existing upstream effort, what we got
+  wrong by working in isolation, and the three findings we are offering into
+  it.** Read this one first.
 - `docs/HARDWARE.md` — full board map.
 - `docs/POE.md` — the PoE subsystem, the wire protocol and the port-map trap.
 - `docs/FLASH-AND-RECOVERY.md` — the `.bix` container, boot flow and recovery.
