@@ -1,0 +1,12 @@
+define Device/openmesh_e24
+  $(Device/uimage-rt-loader)
+  SOC := rtl8391
+  DEVICE_VENDOR := OpenMesh
+  DEVICE_MODEL := E24
+  DEVICE_ALT0_VENDOR := Datto
+  DEVICE_ALT0_MODEL := E24v3
+  UIMAGE_MAGIC := 0x00702202
+  IMAGE_SIZE := 13504k
+  DEVICE_PACKAGES += kmod-hwmon-lm63 kmod-pse-realtek-mcu-i2c ethtool-full
+endef
+TARGET_DEVICES += openmesh_e24

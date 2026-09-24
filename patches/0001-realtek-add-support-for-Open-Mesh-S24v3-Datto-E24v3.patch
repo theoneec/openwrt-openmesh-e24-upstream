@@ -1,0 +1,632 @@
+From fb52e6826ecbb688f59d68bbb7f6008a5f5e47d4 Mon Sep 17 00:00:00 2001
+From: James Perez-Clifton <jamesperezclifton2016@gmail.com>
+Date: Thu, 24 Sep 2026 06:04:25 +0000
+Subject: [PATCH] realtek: add support for Open Mesh S24v3 / Datto E24v3
+
+Add support for the Open Mesh S24v3, also sold as the Datto Networking
+E24v3: a 24-port Gigabit PoE+ switch with two 10G SFP+ uplinks. It is
+the RTL8396M revision of the same Senao ODM platform as the already
+supported rtl8380 Open Mesh S8-L (datto,l8).
+
+Specifications:
+- SoC:      Realtek RTL8396M ("Cypress", rtl839x)
+- RAM:      256 MiB DDR3
+- Flash:    32 MiB SPI-NOR (Macronix MX25L256xx)
+- Ethernet: 24x 10/100/1000 copper on three octal RTL8218B over QSGMII,
+            plus 2x 10G SFP+ behind an external RTL8295R
+- PoE:      24x 802.3af/at, 30 W per port, 410 W chassis budget
+- LEDs:     power, fault, LAN/PoE mode, PoE budget
+- Buttons:  reset, LED mode
+- Console:  UART, 115200 8n1
+
+Datapath
+--------
+
+The 24 copper ports are MAC IDs 0..23 on QSGMII serdes 0..5, with the
+three octal PHYs based at MDIO/MAC address 0, 8 and 16. MDIO address
+equals MAC port ID, and each octal PHY is grouped as an
+ethernet-phy-package, following the rtl839x convention used by
+zyxel,gs1920-24hp-v2.
+
+The two SFP+ cages are MAC ID 24 (serdes 8) and MAC ID 36 (serdes 12),
+both behind an external RTL8295R. That PHY has no mainline driver and
+the vendor firmware selects the interface mode at runtime from the
+detected module (10GBase-R, falling back to 1000BX/100BX), so there is
+no static mode that could be encoded here. Both ports are therefore
+declared disabled rather than given a fixed-link: a fixed-link would
+make the kernel report an unconditional 10G carrier on an empty cage,
+which poisons bridging and STP decisions. Everything needed for a later
+RTL8295R implementation (MAC IDs, serdes, module EEPROM and sideband
+locations) is recorded in the DTS comments.
+
+PoE
+---
+
+The PoE MCU is reached over a software bit-banged I2C bus on SoC GPIO
+(SCL gpio0 line 13, SDA gpio0 line 14), modelled with i2c-gpio. The MCU
+answers at 7-bit address 0x20 and identifies as a Nuvoton M05xx LAN MCU
+fronting BCM59121 (id 0xe121), 24 ports across three PSE chips. Its
+12-byte message format is exactly the one the in-tree Realtek PSE-MCU
+I2C driver already speaks, so realtek,pse-mcu-gen1-smbus binds without a
+new driver and no firmware blob is required.
+
+The PSE channel index is not the port index on this board. The vendor
+firmware programs the MCU's own port-remap feature with a table of
+i ^ 3, i.e. each aligned group of four channels reversed, so that its
+userspace sees a 1:1 view. The mainline driver implements neither the
+remap-enable nor the table-push opcode, so the raw order is what Linux
+sees and the DTS compensates by attaching phy<n> to PSE_PI(n ^ 3).
+This was confirmed on hardware: before the mapping, a PD on physical
+port 1 reported delivering power on lan4. The two corrections are
+mutually exclusive and the DTS says so: if the driver ever programs the
+MCU remap, this XOR has to be removed.
+
+Thermal
+-------
+
+An LM63 fan controller and temperature sensor shares the bit-banged bus
+at 0x4c, the same LM63 plus PSE-MCU combination as linksys,lgs328mpc-v2.
+The DTS binds the hwmon driver; the stock bootloader leaves the chip in
+manual mode at PWM 0, so a fan curve still has to be programmed at boot.
+
+Boot and flash
+--------------
+
+The stock Senao U-Boot 2011.12 boots a uImage whose magic word has been
+replaced by the board ID; there is no cryptographic signature, only the
+header and payload CRCs. An OpenWrt uImage stamped with UIMAGE_MAGIC
+0x00702202 is therefore accepted by the unmodified stock loader, the
+same mechanism as datto_l8. Stock partition names and offsets are kept
+so U-Boot and the factory data stay intact, and the two 0xd30000 runtime
+slots are mtd-concat'd into a single firmware region. The base MAC is
+read from the u-boot-env ethaddr via nvmem.
+
+SOC is set to rtl8391 because the RTL8396M has no dedicated in-tree SoC
+token; the true part is read from the chip ID register at runtime, and
+rtl8391 matches the closest 24-port 839x board.
+
+Signed-off-by: James Perez-Clifton <jamesperezclifton2016@gmail.com>
+---
+ .../realtek/dts/rtl8391_openmesh_e24.dts      | 508 ++++++++++++++++++
+ target/linux/realtek/image/rtl839x.mk         |  13 +
+ 2 files changed, 521 insertions(+)
+ create mode 100644 target/linux/realtek/dts/rtl8391_openmesh_e24.dts
+
+diff --git a/target/linux/realtek/dts/rtl8391_openmesh_e24.dts b/target/linux/realtek/dts/rtl8391_openmesh_e24.dts
+new file mode 100644
+index 0000000000..986bd17214
+--- /dev/null
++++ b/target/linux/realtek/dts/rtl8391_openmesh_e24.dts
+@@ -0,0 +1,508 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/leds/common.h>
++
++#include "rtl839x.dtsi"
++
++/ {
++	compatible = "openmesh,e24", "datto,e24v3", "realtek,rtl8391-soc";
++	model = "Open Mesh E24v3";
++
++	/*
++	 * SoC is the RTL8396M ("Cypress", rtl839x). The rtl839x target only
++	 * carries the realtek,rtl839{1,2,3}-soc compatibles; the true part is
++	 * read from the chip-ID register at runtime, so "realtek,rtl8391-soc"
++	 * is used to match the closest in-tree 24-port 839x board
++	 * (zyxel,gs1920-24hp-v2), exactly as the recipe SOC token (rtl8391) does.
++	 */
++
++	aliases {
++		label-mac-device = &ethernet0;
++		led-boot = &led_power;
++		led-failsafe = &led_fault;
++		led-running = &led_power;
++		led-upgrade = &led_power;
++	};
++
++	memory@0 {
++		device_type = "memory";
++		reg = <0x0 0x10000000>;
++	};
++
++	/*
++	 * Board LEDs. Power, LAN/PoE mode and fault sit on the RTL8231 GPIO
++	 * expander and keep the pin roles and polarities of the S24 sibling
++	 * (same Senao board wiring).
++	 *
++	 * The fault LED is the one the vendor's fan-fail poller drives (the
++	 * code behind the strings "Detect fan failed." / "Fan has recovered"):
++	 * it is initialised to 1 (off) at boot and pulled to 0 only on fan
++	 * failure, i.e. active low.
++	 *
++	 * The PoE power-budget LED is the one role that does NOT follow the
++	 * S24: the E24 vendor firmware drives SoC gpio0 line 19 (lit = over
++	 * budget), not the S24's line 12.
++	 *
++	 * The 24 copper port link/act LEDs are driven by the RTL839x internal
++	 * serial-LED block, not by GPIO.
++	 */
++	leds {
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinmux_disable_sys_led>;
++		compatible = "gpio-leds";
++
++		led_power: led-0 {
++			function = LED_FUNCTION_POWER;
++			color = <LED_COLOR_ID_GREEN>;
++			gpios = <&gpio1 3 GPIO_ACTIVE_LOW>;
++		};
++
++		/* high: LAN Mode, low: PoE Mode */
++		led_lan_mode: led-1 {
++			label = "green:lan-mode";
++			gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;
++		};
++
++		led_fault: led-2 {
++			function = LED_FUNCTION_FAULT;
++			color = <LED_COLOR_ID_AMBER>;
++			gpios = <&gpio1 2 GPIO_ACTIVE_LOW>;
++		};
++
++		led_poe_max: led-3 {
++			label = "amber:poe-max";
++			gpios = <&gpio0 19 GPIO_ACTIVE_LOW>;
++		};
++	};
++
++	/*
++	 * gpio0 is an interrupt-capable SoC GPIO controller, so plain gpio-keys
++	 * suffices: both keys take their IRQ from gpiod_to_irq() on that
++	 * controller, no explicit interrupt property required.
++	 *
++	 * Both lines are E24-specific and were recovered from the vendor
++	 * firmware; neither is inherited from the S24 sibling. The vendor's
++	 * board_reset_init() builds gpioId 0x00020002, and the vendor encodes a
++	 * line as group * 8 + pin, so group 2 pin 2 = SoC gpio0 line 18 for
++	 * reset. The S24's line 11 is referenced by nothing in the entire E24
++	 * vendor firmware, so the previous value here was simply wrong.
++	 *
++	 * The LED-mode button is SoC gpio0 line 17 with a ~50 ms debounce in the
++	 * vendor handler. Its GPIO_ACTIVE_LOW polarity is INFERRED, not
++	 * verified: the vendor handler acts on level 1, which is consistent with
++	 * an active-low button acting on the release edge. Bench-verify before
++	 * relying on it.
++	 *
++	 * SoC gpio0 line 22 is the fan-fail input (active low: 0 = fan failed).
++	 * It is deliberately left UNCLAIMED by every node here so that it stays
++	 * readable from userspace with the gpiod tools (`gpioget <chip> 22`) for
++	 * thermal diagnostics. Modelling it as a gpio-key would hand the line to
++	 * the input layer, which takes the line exclusively and makes it
++	 * unreadable - and a fan failure is a level, not a keypress.
++	 */
++	keys {
++		compatible = "gpio-keys";
++
++		reset {
++			label = "reset";
++			gpios = <&gpio0 18 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_RESTART>;
++		};
++
++		mode {
++			label = "mode";
++			gpios = <&gpio0 17 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_LIGHTS_TOGGLE>;
++			debounce-interval = <50>;
++		};
++	};
++
++	/*
++	 * PoE MCU: the SoC bit-bangs I2C ("SMI group 6") on internal SoC GPIOs
++	 * (SCK = gpio0 line 13, SDA = gpio0 line 14) to a single PoE MCU at 0x20
++	 * which fans out to the Broadcom quad-PSE dies. The MCU answers the
++	 * identify command as a Nuvoton M05xx LAN MCU fronting BCM59121
++	 * (id 0xe121), 24 ports across 3 PSE chips. No firmware blob is uploaded
++	 * to it, so PoE needs no binary firmware and no loader cooperation.
++	 * Bound by the in-tree Realtek PSE-MCU I2C driver, the same
++	 * transport/dialect used by zyxel,gs1920-24hp-v2.
++	 *
++	 * The 7-bit slave address is 0x20: the vendor custom.ko funnels every
++	 * PoE message through poe_i2c_cmd_set(), and all 25 call sites load
++	 * 0x20 as the address. 0x21 is a message opcode carried in byte 0 of
++	 * the command frame, not an address.
++	 */
++	i2c0: i2c-gpio-0 {
++		compatible = "i2c-gpio";
++		sda-gpios = <&gpio0 14 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpio0 13 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <2>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		pse: ethernet-pse@20 {
++			compatible = "openmesh,e24-pse", "realtek,pse-mcu-gen1-smbus";
++			reg = <0x20>;
++
++			pse-pis {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				PSE_PI(0)
++				PSE_PI(1)
++				PSE_PI(2)
++				PSE_PI(3)
++				PSE_PI(4)
++				PSE_PI(5)
++				PSE_PI(6)
++				PSE_PI(7)
++				PSE_PI(8)
++				PSE_PI(9)
++				PSE_PI(10)
++				PSE_PI(11)
++				PSE_PI(12)
++				PSE_PI(13)
++				PSE_PI(14)
++				PSE_PI(15)
++				PSE_PI(16)
++				PSE_PI(17)
++				PSE_PI(18)
++				PSE_PI(19)
++				PSE_PI(20)
++				PSE_PI(21)
++				PSE_PI(22)
++				PSE_PI(23)
++			};
++		};
++
++		/*
++		 * LM63 fan controller / temperature sensor, sharing the
++		 * bit-banged bus with the PoE MCU. Confirmed on live hardware:
++		 * 0x4c ACKs and reports manufacturer (0xFE) = 0x01 and chip
++		 * (0xFF) = 0x41.
++		 *
++		 * This node only binds the hwmon driver - it exposes the chip,
++		 * it does not program it. The chip is left by the stock
++		 * bootloader in manual mode with PWM 0, i.e. fans stopped, so
++		 * the fan lookup table is programmed at boot by
++		 * /etc/init.d/hwmon_fancontrol. Do not drop that init script
++		 * on the assumption that this node is enough.
++		 */
++		lm63@4c {
++			compatible = "national,lm63";
++			reg = <0x4c>;
++		};
++	};
++
++	/*
++	 * The two stock RUNTIME slots are concatenated into a single OpenWrt
++	 * firmware region (see &spi0) so kernel+rootfs+overlay fit; this drops
++	 * stock A/B failover, as the upstream S8-L (datto,l8) sibling also does.
++	 * ih-magic 0x00702202 is the E24 uImage board-id word: an OpenWrt uImage
++	 * stamped with UIMAGE_MAGIC=0x00702202 boots under the unmodified stock
++	 * "boota".
++	 */
++	virtual_flash {
++		compatible = "mtd-concat";
++		devices = <&fwconcat0>, <&fwconcat1>;
++
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			partition@0 {
++				label = "firmware";
++				reg = <0x0 0x1a60000>;
++				compatible = "openwrt,uimage", "denx,uimage";
++				openwrt,ih-magic = <0x00702202>;
++			};
++		};
++	};
++};
++
++/*
++ * External RTL8231 GPIO/LED expander on the SoC indirect (aux) MDIO bus.
++ * Its integrated LED controller is unused: the 24 copper port LEDs are
++ * driven by the RTL8396M internal serial-LED block. The expander bus
++ * address is inherited from the L24 sibling (same Senao board wiring);
++ * bench-verify.
++ */
++&mdio_aux {
++	status = "okay";
++
++	gpio1: expander@0 {
++		compatible = "realtek,rtl8231";
++		reg = <0>;
++
++		gpio-controller;
++		#gpio-cells = <2>;
++		gpio-ranges = <&gpio1 0 0 37>;
++
++		led-controller {
++			compatible = "realtek,rtl8231-leds";
++			status = "disabled";
++		};
++	};
++};
++
++/*
++ * Port / PHY / MDIO map (vendor portConf_8396_24ge_2f10g):
++ *   ext RTL8218B #1 -> MDIO 0..7    (lan1..lan8)
++ *   ext RTL8218B #2 -> MDIO 8..15   (lan9..lan16)
++ *   ext RTL8218B #3 -> MDIO 16..23  (lan17..lan24)
++ * MDIO address == MAC port id; all 24 copper PHYs are C22 on mdio_bus0.
++ * Each external octal PHY is grouped as an ethernet-phy-package, the
++ * rtl839x convention (matches zyxel,gs1920-24hp-v2).
++ */
++&mdio_bus0 {
++	ethernet-phy-package@0 {
++		#address-cells = <1>;
++		#size-cells = <0>;
++		reg = <0>;
++
++		PHY_C22(0, 0)
++		PHY_C22(1, 1)
++		PHY_C22(2, 2)
++		PHY_C22(3, 3)
++		PHY_C22(4, 4)
++		PHY_C22(5, 5)
++		PHY_C22(6, 6)
++		PHY_C22(7, 7)
++	};
++
++	ethernet-phy-package@8 {
++		#address-cells = <1>;
++		#size-cells = <0>;
++		reg = <8>;
++
++		PHY_C22(8, 8)
++		PHY_C22(9, 9)
++		PHY_C22(10, 10)
++		PHY_C22(11, 11)
++		PHY_C22(12, 12)
++		PHY_C22(13, 13)
++		PHY_C22(14, 14)
++		PHY_C22(15, 15)
++	};
++
++	ethernet-phy-package@16 {
++		#address-cells = <1>;
++		#size-cells = <0>;
++		reg = <16>;
++
++		PHY_C22(16, 16)
++		PHY_C22(17, 17)
++		PHY_C22(18, 18)
++		PHY_C22(19, 19)
++		PHY_C22(20, 20)
++		PHY_C22(21, 21)
++		PHY_C22(22, 22)
++		PHY_C22(23, 23)
++	};
++};
++
++&switch0 {
++	ethernet-ports {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		/* 24x GbE copper - QSGMII on serdes0..5 (3x RTL8218B) */
++		SWITCH_PORT_SDS(0, 1, 0, 0, qsgmii)
++		SWITCH_PORT_SDS(1, 2, 0, 1, qsgmii)
++		SWITCH_PORT_SDS(2, 3, 0, 2, qsgmii)
++		SWITCH_PORT_SDS(3, 4, 0, 3, qsgmii)
++		SWITCH_PORT_SDS(4, 5, 1, 0, qsgmii)
++		SWITCH_PORT_SDS(5, 6, 1, 1, qsgmii)
++		SWITCH_PORT_SDS(6, 7, 1, 2, qsgmii)
++		SWITCH_PORT_SDS(7, 8, 1, 3, qsgmii)
++
++		SWITCH_PORT_SDS(8, 9, 2, 0, qsgmii)
++		SWITCH_PORT_SDS(9, 10, 2, 1, qsgmii)
++		SWITCH_PORT_SDS(10, 11, 2, 2, qsgmii)
++		SWITCH_PORT_SDS(11, 12, 2, 3, qsgmii)
++		SWITCH_PORT_SDS(12, 13, 3, 0, qsgmii)
++		SWITCH_PORT_SDS(13, 14, 3, 1, qsgmii)
++		SWITCH_PORT_SDS(14, 15, 3, 2, qsgmii)
++		SWITCH_PORT_SDS(15, 16, 3, 3, qsgmii)
++
++		SWITCH_PORT_SDS(16, 17, 4, 0, qsgmii)
++		SWITCH_PORT_SDS(17, 18, 4, 1, qsgmii)
++		SWITCH_PORT_SDS(18, 19, 4, 2, qsgmii)
++		SWITCH_PORT_SDS(19, 20, 4, 3, qsgmii)
++		SWITCH_PORT_SDS(20, 21, 5, 0, qsgmii)
++		SWITCH_PORT_SDS(21, 22, 5, 1, qsgmii)
++		SWITCH_PORT_SDS(22, 23, 5, 2, qsgmii)
++		SWITCH_PORT_SDS(23, 24, 5, 3, qsgmii)
++
++		/*
++		 * 2x SFP+ cages, front lan25/lan26. Confirmed from the vendor
++		 * firmware: SFP+ #1 is MAC ID 24 -> SerDes 8, and SFP+ #2 is
++		 * MAC ID 36 -> SerDes 12. Note MAC 36, not the 26 used by the
++		 * sibling board's layout.
++		 *
++		 * Both cages sit behind an external RTL8295R PHY, which the
++		 * switch addresses by MIIM port index (mdxMacId 25 and 26).
++		 * The vendor selects the interface mode at RUNTIME from the
++		 * detected SFP media - 10GBase-R, with 1000BX and 100BX as
++		 * fallbacks - so there is no static mode constant that could
++		 * be encoded here.
++		 *
++		 * Left disabled: the RTL8295R has no mainline driver, and a
++		 * fixed-link would make the kernel report "Link is Up -
++		 * 10Gbps/Full" on an empty cage, which poisons bridging and
++		 * STP decisions and misleads userspace.
++		 *
++		 * Both SFP EEPROMs are at I2C 0x50 on the same bit-banged bus
++		 * as the PoE MCU and the LM63. The presence and LOS sidebands
++		 * are on the RTL8231 expander: pins 12 and 11 for port 25,
++		 * pins 21 and 14 for port 26. All of this is recorded for a
++		 * future RTL8295R implementation.
++		 */
++		port@24 {
++			reg = <24>;
++			label = "lan25";
++			status = "disabled";
++		};
++
++		port@36 {
++			reg = <36>;
++			label = "lan26";
++			status = "disabled";
++		};
++
++		/* CPU / management port (fixed rtl839x CPU port) */
++		port@52 {
++			ethernet = <&ethernet0>;
++			reg = <52>;
++			phy-mode = "internal";
++
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
++		};
++	};
++};
++
++&ethernet0 {
++	nvmem-cells = <&macaddr_ubootenv_ethaddr 0>;
++	nvmem-cell-names = "mac-address";
++};
++
++/*
++ * 32 MiB SPI-NOR (MX25L25633F). Stock names/offsets are kept so the stock
++ * U-Boot "boota" and factory data (the base MAC lives in the "ethaddr"
++ * U-Boot env variable) stay intact. The two 0xd30000 RUNTIME slots are
++ * mtd-concat'd (see virtual_flash).
++ */
++&spi0 {
++	status = "okay";
++
++	flash@0 {
++		compatible = "jedec,spi-nor";
++		reg = <0>;
++		spi-max-frequency = <10000000>;
++
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			partition@0 {
++				label = "u-boot";
++				reg = <0x0 0x80000>;
++				read-only;
++			};
++			partition@80000 {
++				label = "u-boot-env";
++				reg = <0x80000 0x10000>;
++
++				nvmem-layout {
++					compatible = "u-boot,env";
++
++					macaddr_ubootenv_ethaddr: ethaddr {
++						#nvmem-cell-cells = <1>;
++					};
++				};
++			};
++			partition@90000 {
++				label = "u-boot-env2";
++				reg = <0x90000 0x10000>;
++			};
++			partition@a0000 {
++				label = "cfg";
++				reg = <0xa0000 0x400000>;
++			};
++			partition@4a0000 {
++				label = "log";
++				reg = <0x4a0000 0x100000>;
++			};
++			fwconcat0: partition@5a0000 {
++				label = "runtime";
++				reg = <0x5a0000 0xd30000>;
++			};
++			fwconcat1: partition@12d0000 {
++				label = "runtime2";
++				reg = <0x12d0000 0xd30000>;
++			};
++		};
++	};
++};
++
++/*
++ * PoE is on the 24 copper ports only: tie each copper PHY to its PSE PI.
++ *
++ * The PSE channel index is NOT the front-panel/PHY port index on this
++ * board. The PoE MCU has a built-in port-remap feature which the vendor
++ * firmware enables at init: custom.ko board_poe_init() sends opcode 0x02
++ * to turn the remap on, then opcode 0x1D to push a 24-entry port-map
++ * table. That table sits verbatim in custom.ko .rodata at offset 0x46c:
++ *
++ *   03 02 01 00  07 06 05 04  0b 0a 09 08
++ *   0f 0e 0d 0c  13 12 11 10  17 16 15 14
++ *
++ * i.e. table[i] == i ^ 3 -- each aligned group of four channels reversed.
++ * (A second, plain-identity array follows it.)
++ *
++ * Our in-tree Realtek PSE-MCU driver implements NEITHER opcode 0x02 nor
++ * opcode 0x1D, so the remap is never programmed and the raw XOR-3 channel
++ * order is what the MCU exposes to Linux. Confirmed on hardware: a PD in
++ * front-panel port 1 (phy0) is powered and linked, yet "delivering power"
++ * is reported on lan4 -- phy index 3 -- and 0 ^ 3 == 3, exactly as the
++ * vendor table predicts.
++ *
++ * The DTS therefore compensates: phy<n> attaches to PSE_PI(n ^ 3). The
++ * PSE_PI() node definitions above stay a plain 0..23 -- only these
++ * references are permuted.
++ *
++ * WARNING: if the driver ever gains opcodes 0x02 + 0x1D and programs the
++ * MCU remap itself, this XOR MUST be removed. The two corrections would
++ * otherwise cancel each other and re-scramble the mapping.
++ */
++&phy0  { pses = <&pse_pi3>; };
++&phy1  { pses = <&pse_pi2>; };
++&phy2  { pses = <&pse_pi1>; };
++&phy3  { pses = <&pse_pi0>; };
++&phy4  { pses = <&pse_pi7>; };
++&phy5  { pses = <&pse_pi6>; };
++&phy6  { pses = <&pse_pi5>; };
++&phy7  { pses = <&pse_pi4>; };
++&phy8  { pses = <&pse_pi11>; };
++&phy9  { pses = <&pse_pi10>; };
++&phy10 { pses = <&pse_pi9>; };
++&phy11 { pses = <&pse_pi8>; };
++&phy12 { pses = <&pse_pi15>; };
++&phy13 { pses = <&pse_pi14>; };
++&phy14 { pses = <&pse_pi13>; };
++&phy15 { pses = <&pse_pi12>; };
++&phy16 { pses = <&pse_pi19>; };
++&phy17 { pses = <&pse_pi18>; };
++&phy18 { pses = <&pse_pi17>; };
++&phy19 { pses = <&pse_pi16>; };
++&phy20 { pses = <&pse_pi23>; };
++&phy21 { pses = <&pse_pi22>; };
++&phy22 { pses = <&pse_pi21>; };
++&phy23 { pses = <&pse_pi20>; };
+diff --git a/target/linux/realtek/image/rtl839x.mk b/target/linux/realtek/image/rtl839x.mk
+index 2f8a284d5d..28e064d578 100644
+--- a/target/linux/realtek/image/rtl839x.mk
++++ b/target/linux/realtek/image/rtl839x.mk
+@@ -171,3 +171,16 @@ define Device/zyxel_gs1920-24hp-v2
+   DEVICE_VARIANT := v2
+ endef
+ TARGET_DEVICES += zyxel_gs1920-24hp-v2
++
++define Device/openmesh_e24
++  $(Device/uimage-rt-loader)
++  SOC := rtl8391
++  DEVICE_VENDOR := OpenMesh
++  DEVICE_MODEL := E24
++  DEVICE_ALT0_VENDOR := Datto
++  DEVICE_ALT0_MODEL := E24v3
++  UIMAGE_MAGIC := 0x00702202
++  IMAGE_SIZE := 13504k
++  DEVICE_PACKAGES += kmod-hwmon-lm63 kmod-pse-realtek-mcu-i2c ethtool-full
++endef
++TARGET_DEVICES += openmesh_e24
+-- 
+2.43.0
+
